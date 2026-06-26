@@ -1,0 +1,19 @@
+{
+  "$schema": "https://wails.io/schemas/config.v2.json",
+  "name": "procom",
+  "outputfilename": "procom",
+  "frontend:dir": "frontend",
+  "frontend:install": "npm install --cache ../.npm-cache",
+  "frontend:build": "npm run build",
+  "frontend:dev:watcher": "npm run dev",
+  "frontend:dev:serverUrl": "auto",
+  "wailsjsdir": "frontend/src/wailsjs",
+  "assetdir": "frontend/dist",
+  "build:dir": "build",
+  "info": {
+    "companyName": "PROCOM",
+    "productName": "PROCOM",
+    "productVersion": "0.1.0",
+    "comments": "Offline production communication transcription"
+  }
+}
