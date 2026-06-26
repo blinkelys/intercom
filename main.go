@@ -18,7 +18,7 @@ import (
 )
 
 func main() {
-	logger := log.New(os.Stdout, "procom ", log.LstdFlags|log.Lmicroseconds)
+	logger := log.New(os.Stdout, "intercom ", log.LstdFlags|log.Lmicroseconds)
 	runtimeBundle, err := bootstrap.NewRuntime(logger)
 	if err != nil {
 		log.Fatalf("initialize runtime: %v", err)
@@ -27,7 +27,7 @@ func main() {
 	shell := NewDesktopShell(runtimeBundle, logger)
 
 	if err := wails.Run(&options.App{
-		Title:            "PROCOM",
+		Title:            "INTERCOM",
 		Width:            1440,
 		Height:           960,
 		MinWidth:         1100,
@@ -99,6 +99,22 @@ func (b *FrontendBridge) GetBootstrap() (frontendbridge.BootstrapPayload, error)
 
 func (b *FrontendBridge) UpdateChannel(input frontendbridge.ChannelUpdateInput) (frontendbridge.Channel, error) {
 	return b.bridge.UpdateChannel(input)
+}
+
+func (b *FrontendBridge) AddChannel(input frontendbridge.ChannelAddInput) (frontendbridge.Channel, error) {
+	return b.bridge.AddChannel(input)
+}
+
+func (b *FrontendBridge) RemoveChannel(channelID string) error {
+	return b.bridge.RemoveChannel(channelID)
+}
+
+func (b *FrontendBridge) UpdateKeywords(rules []frontendbridge.KeywordRuleInput) error {
+	return b.bridge.UpdateKeywords(rules)
+}
+
+func (b *FrontendBridge) UpdateOSC(input frontendbridge.OSCSettingsInput) error {
+	return b.bridge.UpdateOSC(input)
 }
 
 var _ fs.FS = os.DirFS(".")

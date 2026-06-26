@@ -11,6 +11,7 @@ import (
 	"procom/internal/channels"
 	"procom/internal/config"
 	"procom/internal/events"
+	"procom/internal/osc"
 	"procom/internal/speech"
 	"procom/internal/transcript"
 )
@@ -46,6 +47,10 @@ func TestBridgeGetBootstrapMapsChannelAndTranscriptState(t *testing.T) {
 	transcriptManager, err := transcript.NewManager(cfg, bus, logger)
 	if err != nil {
 		t.Fatalf("new transcript manager: %v", err)
+	}
+	oscManager, err := osc.NewManager(cfg, bus, logger, transcriptManager, nil)
+	if err != nil {
+		t.Fatalf("new osc manager: %v", err)
 	}
 	speechManager, err := speech.NewManager(cfg, bus, logger, speech.DefaultEngineFactory)
 	if err != nil {
@@ -85,7 +90,7 @@ func TestBridgeGetBootstrapMapsChannelAndTranscriptState(t *testing.T) {
 		}
 	}
 
-	bridge, err := New(cfg, bus, logger, channelManager, audioManager, speechManager, transcriptManager)
+	bridge, err := New(cfg, bus, logger, channelManager, audioManager, oscManager, speechManager, transcriptManager)
 	if err != nil {
 		t.Fatalf("new bridge: %v", err)
 	}
@@ -130,12 +135,16 @@ func TestBridgeUpdateChannelDelegatesToManager(t *testing.T) {
 	if err != nil {
 		t.Fatalf("new transcript manager: %v", err)
 	}
+	oscManager, err := osc.NewManager(cfg, bus, logger, transcriptManager, nil)
+	if err != nil {
+		t.Fatalf("new osc manager: %v", err)
+	}
 	speechManager, err := speech.NewManager(cfg, bus, logger, speech.DefaultEngineFactory)
 	if err != nil {
 		t.Fatalf("new speech manager: %v", err)
 	}
 
-	bridge, err := New(cfg, bus, logger, channelManager, audioManager, speechManager, transcriptManager)
+	bridge, err := New(cfg, bus, logger, channelManager, audioManager, oscManager, speechManager, transcriptManager)
 	if err != nil {
 		t.Fatalf("new bridge: %v", err)
 	}

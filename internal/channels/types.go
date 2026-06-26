@@ -5,6 +5,8 @@ import "time"
 const (
 	// EventTypeUpdated is published when channel state changes.
 	EventTypeUpdated = "channels.updated"
+	// EventTypeDeleted is published when a channel is removed.
+	EventTypeDeleted = "channels.deleted"
 )
 
 // Channel is the runtime read model for one communication channel.
@@ -15,6 +17,7 @@ type Channel struct {
 	Icon        string
 	InputDevice string
 	Language    string
+	GainDB      float64
 	Enabled     bool
 }
 
@@ -26,6 +29,19 @@ type UpdateRequest struct {
 	Icon        string
 	InputDevice string
 	Language    string
+	GainDB      float64
+	Enabled     bool
+}
+
+// AddRequest contains fields for creating a new channel.
+type AddRequest struct {
+	ID          string
+	Name        string
+	Color       string
+	Icon        string
+	InputDevice string
+	Language    string
+	GainDB      float64
 	Enabled     bool
 }
 
@@ -37,5 +53,11 @@ type Snapshot struct {
 // Update is the event payload emitted on channel changes.
 type Update struct {
 	Channel    Channel
+	OccurredAt time.Time
+}
+
+// Deleted is the event payload emitted on channel removal.
+type Deleted struct {
+	ChannelID  string
 	OccurredAt time.Time
 }

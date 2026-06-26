@@ -1,6 +1,6 @@
 import { create } from 'zustand'
 import type { BackendClient, BackendSubscription } from '../backend/client'
-import type { AudioLevelsView, ChannelUpdateInput, ChannelView, InputDeviceView, RuntimeStatus, SpeechDiagnosticsView, TranscriptEntryView, TranscriptPartialView } from '../types'
+import type { AudioLevelsView, ChannelAddInput, ChannelUpdateInput, ChannelView, InputDeviceView, KeywordRuleInput, KeywordRuleView, OscSettingsInput, OscSettingsView, RuntimeStatus, SpeechDiagnosticsView, TranscriptEntryView, TranscriptPartialView } from '../types'
 
 const defaultSpeechDiagnostics: SpeechDiagnosticsView = {
   model: 'mlx-community/whisper-tiny',
@@ -17,12 +17,20 @@ const defaultSpeechDiagnostics: SpeechDiagnosticsView = {
   updatedAt: '',
 }
 
+const defaultOscSettings: OscSettingsView = {
+  enabled: false,
+  destination: '',
+  port: 0,
+}
+
 type TranscriptStore = {
   channels: ChannelView[]
   inputDevices: InputDeviceView[]
   audioLevels: AudioLevelsView
   entries: TranscriptEntryView[]
   partials: Record<string, TranscriptPartialView>
+  keywords: KeywordRuleView[]
+  osc: OscSettingsView
   speech: SpeechDiagnosticsView
   selectedChannelId: string
   status: RuntimeStatus
@@ -33,6 +41,10 @@ type TranscriptStore = {
   bootstrap: (client: BackendClient) => Promise<() => void>
   selectChannel: (channelId: string) => void
   saveChannel: (client: BackendClient, input: ChannelUpdateInput) => Promise<void>
+  addChannel: (client: BackendClient, input: ChannelAddInput) => Promise<void>
+  removeChannel: (client: BackendClient, channelId: string) => Promise<void>
+  saveKeywords: (client: BackendClient, rules: KeywordRuleInput[]) => Promise<void>
+  saveOsc: (client: BackendClient, input: OscSettingsInput) => Promise<void>
 }
 
 let activeSubscription: BackendSubscription | null = null
@@ -43,6 +55,8 @@ export const useTranscriptStore = create<TranscriptStore>((set) => ({
   audioLevels: {},
   entries: [],
   partials: {},
+  keywords: [],
+  osc: defaultOscSettings,
   speech: defaultSpeechDiagnostics,
   selectedChannelId: 'all',
   status: 'connecting',
@@ -59,6 +73,8 @@ export const useTranscriptStore = create<TranscriptStore>((set) => ({
       audioLevels: payload.audioLevels,
       entries: payload.snapshot.entries,
       partials: payload.snapshot.partials,
+      keywords: payload.keywords,
+      osc: payload.osc,
       speech: payload.speech,
       status: payload.status,
       engineLabel: payload.engineLabel,
@@ -74,6 +90,8 @@ export const useTranscriptStore = create<TranscriptStore>((set) => ({
         audioLevels: update.audioLevels ?? state.audioLevels,
         entries: update.snapshot?.entries ?? state.entries,
         partials: update.snapshot?.partials ?? state.partials,
+        keywords: update.keywords ?? state.keywords,
+        osc: update.osc ?? state.osc,
         speech: update.speech ?? state.speech,
         status: update.status ?? state.status,
       }))
@@ -95,6 +113,56 @@ export const useTranscriptStore = create<TranscriptStore>((set) => ({
         channels: state.channels.map((channel) => (channel.id === updated.id ? updated : channel)),
         savingChannel: false,
       }))
+    } catch (error) {
+      set({ savingChannel: false, status: 'offline' })
+      throw error
+    }
+  },
+  addChannel: async (client, input) => {
+    set({ savingChannel: true })
+    try {
+      const added = await client.addChannel(input)
+      set((state) => ({
+        channels: [...state.channels, added],
+        selectedChannelId: added.id,
+        savingChannel: false,
+      }))
+    } catch (error) {
+      set({ savingChannel: false, status: 'offline' })
+      throw error
+    }
+  },
+  removeChannel: async (client, channelId) => {
+    set({ savingChannel: true })
+    try {
+      await client.removeChannel(channelId)
+      set((state) => ({
+        channels: state.channels.filter((channel) => channel.id !== channelId),
+        entries: state.entries.filter((entry) => entry.channelId !== channelId),
+        partials: Object.fromEntries(Object.entries(state.partials).filter(([id]) => id !== channelId)),
+        selectedChannelId: state.selectedChannelId === channelId ? 'all' : state.selectedChannelId,
+        savingChannel: false,
+      }))
+    } catch (error) {
+      set({ savingChannel: false, status: 'offline' })
+      throw error
+    }
+  },
+  saveKeywords: async (client, rules) => {
+    set({ savingChannel: true })
+    try {
+      await client.updateKeywords(rules)
+      set({ keywords: rules, savingChannel: false })
+    } catch (error) {
+      set({ savingChannel: false, status: 'offline' })
+      throw error
+    }
+  },
+  saveOsc: async (client, input) => {
+    set({ savingChannel: true })
+    try {
+      await client.updateOsc(input)
+      set({ osc: input, savingChannel: false })
     } catch (error) {
       set({ savingChannel: false, status: 'offline' })
       throw error

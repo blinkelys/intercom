@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +20,7 @@ const (
 	defaultSampleRate      = 16000
 	defaultFramesPerBuffer = 1024
 	defaultRingBufferSize  = defaultSampleRate * 5
+	defaultRecoveryTick    = 3 * time.Second
 )
 
 // Manager owns audio device discovery and one capture session per configured channel.
@@ -30,9 +32,11 @@ type Manager struct {
 	sampleRate         int
 	framesPerBuffer    int
 	ringBufferCapacity int
+	recoveryTick       time.Duration
 
 	mu        sync.RWMutex
 	sessions  map[string]*session
+	channels  map[string]config.ChannelConfig
 	inventory DeviceInventory
 	sub       *events.Subscription
 	cancel    context.CancelFunc
@@ -69,7 +73,13 @@ func NewManager(cfg config.Config, bus *events.Bus, logger *log.Logger, driver D
 		sampleRate:         defaultSampleRate,
 		framesPerBuffer:    defaultFramesPerBuffer,
 		ringBufferCapacity: defaultRingBufferSize,
+		recoveryTick:       defaultRecoveryTick,
 		sessions:           make(map[string]*session),
+		channels:           make(map[string]config.ChannelConfig, len(cfg.Channels)),
+	}
+
+	for _, channel := range cfg.Channels {
+		manager.channels[channel.ID] = channel
 	}
 
 	for _, opt := range opts {
@@ -84,6 +94,9 @@ func NewManager(cfg config.Config, bus *events.Bus, logger *log.Logger, driver D
 	}
 	if manager.ringBufferCapacity <= 0 {
 		return nil, fmt.Errorf("ring buffer capacity must be positive")
+	}
+	if manager.recoveryTick <= 0 {
+		return nil, fmt.Errorf("recovery tick must be positive")
 	}
 
 	return manager, nil
@@ -106,13 +119,10 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.started = true
 	m.mu.Unlock()
 
-	devices, err := m.driver.Devices(runCtx)
-	if err != nil {
-		m.publishInventory(nil, err)
+	if err := m.RefreshInventory(runCtx); err != nil {
 		m.logger.Printf("audio device enumeration failed: %v", err)
-		return nil
 	}
-	m.publishInventory(devices, nil)
+	devices := m.Inventory().Devices
 
 	deviceByID := make(map[string]Device, len(devices))
 	availableIDs := make([]string, 0, len(devices))
@@ -122,8 +132,10 @@ func (m *Manager) Start(ctx context.Context) error {
 	}
 	usedDeviceIDs := make(map[string]struct{})
 
-	for _, channel := range m.config.Channels {
-		resolved, statusState, statusMessage := resolveChannelDevice(channel, availableIDs, usedDeviceIDs, deviceByID, true)
+	channelSnapshot := m.channelSnapshot()
+	for _, channel := range channelSnapshot {
+		allowAutoAssign := strings.TrimSpace(channel.InputDevice) != ""
+		resolved, statusState, statusMessage := resolveChannelDevice(channel, availableIDs, usedDeviceIDs, deviceByID, allowAutoAssign)
 		if statusState != "" {
 			m.publishStatus(channel.ID, resolved.InputDevice, statusState, statusMessage)
 			continue
@@ -147,6 +159,20 @@ func (m *Manager) Start(ctx context.Context) error {
 	m.wg.Add(1)
 	go m.consumeEvents(runCtx, subscription)
 
+	return nil
+}
+
+// RefreshInventory re-enumerates available input devices and updates inventory state.
+func (m *Manager) RefreshInventory(ctx context.Context) error {
+	devices, err := m.driver.Devices(ctx)
+	if err != nil {
+		m.mu.RLock()
+		existing := append([]Device(nil), m.inventory.Devices...)
+		m.mu.RUnlock()
+		m.publishInventory(existing, err)
+		return err
+	}
+	m.publishInventory(devices, nil)
 	return nil
 }
 
@@ -264,6 +290,13 @@ func WithRingBufferCapacity(capacity int) ManagerOption {
 	}
 }
 
+// WithRecoveryTick overrides the periodic pipeline recovery interval.
+func WithRecoveryTick(interval time.Duration) ManagerOption {
+	return func(manager *Manager) {
+		manager.recoveryTick = interval
+	}
+}
+
 func (m *Manager) startSession(ctx context.Context, channel config.ChannelConfig) error {
 	m.publishStatus(channel.ID, channel.InputDevice, PipelineStateStarting, "starting capture pipeline")
 
@@ -327,32 +360,104 @@ func (m *Manager) consumeSession(ctx context.Context, current *session) {
 				chunk.CapturedAt = time.Now().UTC()
 			}
 
+			if current.channel.GainDB != 0 {
+				chunk.Frames = applyGainDB(chunk.Frames, current.channel.GainDB)
+			}
+
 			current.buffer.Write(chunk.Frames)
 			m.bus.Publish(events.Event{Type: EventTypeChunkCaptured, Payload: chunk})
 		}
 	}
 }
 
+func applyGainDB(frames []float32, gainDB float64) []float32 {
+	if len(frames) == 0 || gainDB == 0 {
+		return frames
+	}
+	multiplier := math.Pow(10, gainDB/20)
+	if multiplier == 1 {
+		return frames
+	}
+
+	adjusted := make([]float32, len(frames))
+	for index, frame := range frames {
+		value := float64(frame) * multiplier
+		if value > 1 {
+			value = 1
+		} else if value < -1 {
+			value = -1
+		}
+		adjusted[index] = float32(value)
+	}
+	return adjusted
+}
+
 func (m *Manager) consumeEvents(ctx context.Context, subscription *events.Subscription) {
 	defer m.wg.Done()
+	recoveryTicker := time.NewTicker(m.recoveryTick)
+	defer recoveryTicker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
+		case <-recoveryTicker.C:
+			if err := m.RefreshInventory(ctx); err != nil {
+				m.logger.Printf("audio periodic inventory refresh failed: %v", err)
+			}
+			m.reconcileAll(ctx)
 		case event, ok := <-subscription.Events():
 			if !ok {
 				return
 			}
-			if event.Type != channels.EventTypeUpdated {
+			switch event.Type {
+			case channels.EventTypeUpdated:
+				update, ok := event.Payload.(channels.Update)
+				if !ok {
+					continue
+				}
+				channel := toChannelConfig(update.Channel)
+				m.mu.Lock()
+				m.channels[channel.ID] = channel
+				m.mu.Unlock()
+				m.applyChannelUpdate(ctx, channel)
+			case channels.EventTypeDeleted:
+				deleted, ok := event.Payload.(channels.Deleted)
+				if !ok {
+					continue
+				}
+				m.mu.Lock()
+				delete(m.channels, deleted.ChannelID)
+				m.mu.Unlock()
+				if err := m.stopSession(ctx, deleted.ChannelID); err != nil {
+					m.publishStatus(deleted.ChannelID, "", PipelineStateFailed, err.Error())
+				}
+			case EventTypeDevicesUpdated:
+				m.reconcileAll(ctx)
+			default:
 				continue
 			}
-			update, ok := event.Payload.(channels.Update)
-			if !ok {
-				continue
-			}
-			m.applyChannelUpdate(ctx, toChannelConfig(update.Channel))
 		}
 	}
+}
+
+func (m *Manager) reconcileAll(ctx context.Context) {
+	for _, channel := range m.channelSnapshot() {
+		m.applyChannelUpdate(ctx, channel)
+	}
+}
+
+func (m *Manager) channelSnapshot() []config.ChannelConfig {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+
+	snapshot := make([]config.ChannelConfig, 0, len(m.channels))
+	for _, channel := range m.channels {
+		snapshot = append(snapshot, channel)
+	}
+	sort.Slice(snapshot, func(i, j int) bool {
+		return snapshot[i].ID < snapshot[j].ID
+	})
+	return snapshot
 }
 
 func (m *Manager) applyChannelUpdate(ctx context.Context, channel config.ChannelConfig) {
@@ -375,7 +480,13 @@ func (m *Manager) applyChannelUpdate(ctx context.Context, channel config.Channel
 	currentSession, hasSession := m.sessions[channel.ID]
 	m.mu.RUnlock()
 
-	resolved, statusState, statusMessage := resolveChannelDevice(channel, availableIDs, usedDeviceIDs, deviceByID, false)
+	// Protect active pipelines from accidental empty-device updates.
+	if hasSession && channel.Enabled && strings.TrimSpace(channel.InputDevice) == "" {
+		channel.InputDevice = currentSession.channel.InputDevice
+	}
+
+	allowAutoAssign := !hasSession && strings.TrimSpace(channel.InputDevice) != ""
+	resolved, statusState, statusMessage := resolveChannelDevice(channel, availableIDs, usedDeviceIDs, deviceByID, allowAutoAssign)
 	if statusState != "" {
 		if hasSession {
 			_ = m.stopSession(ctx, channel.ID)
@@ -441,6 +552,13 @@ func resolveChannelDevice(channel config.ChannelConfig, availableIDs []string, u
 	}
 
 	if _, ok := deviceByID[deviceID]; !ok {
+		if allowAutoAssign {
+			reassigned := firstUnusedDevice(availableIDs, usedDeviceIDs)
+			if reassigned != "" {
+				resolved.InputDevice = reassigned
+				return resolved, "", ""
+			}
+		}
 		return resolved, PipelineStateMissingDevice, "configured input device is unavailable"
 	}
 
@@ -455,6 +573,7 @@ func toChannelConfig(channel channels.Channel) config.ChannelConfig {
 		Icon:        channel.Icon,
 		InputDevice: channel.InputDevice,
 		Language:    channel.Language,
+		GainDB:      channel.GainDB,
 		Enabled:     channel.Enabled,
 	}
 }
@@ -469,7 +588,10 @@ func levelFromFrames(frames []float32) float64 {
 		sumSquares += sample * sample
 	}
 	rms := math.Sqrt(sumSquares / float64(len(frames)))
-	level := rms * 2.5
+	level := math.Sqrt(rms * 120)
+	if rms > 0 && level < 0.01 {
+		level = 0.01
+	}
 	if level > 1 {
 		return 1
 	}

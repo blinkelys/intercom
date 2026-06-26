@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import json
 import os
+import re
 import sys
 import time
 from collections import defaultdict
@@ -14,29 +15,33 @@ except Exception as exc:
     sys.exit(1)
 
 
-MODEL = os.environ.get("PROCOM_MLX_MODEL", "mlx-community/whisper-tiny")
+MODEL = os.environ.get("PROCOM_MLX_MODEL", "mlx-community/whisper-large-v3-turbo")
 DEFAULT_LANGUAGE = os.environ.get("PROCOM_MLX_LANGUAGE", "").strip()
 TEMPERATURE = float(os.environ.get("PROCOM_MLX_TEMPERATURE", "0"))
-BEST_OF = int(os.environ.get("PROCOM_MLX_BEST_OF", "1"))
+BEST_OF = int(os.environ.get("PROCOM_MLX_BEST_OF", "3"))
 BEAM_SIZE = int(os.environ.get("PROCOM_MLX_BEAM_SIZE", "1"))
-TASK = os.environ.get("PROCOM_MLX_TASK", "transcribe").strip() or "transcribe"
+TASK = "transcribe"
 NO_SPEECH_THRESHOLD = float(os.environ.get("PROCOM_MLX_NO_SPEECH_THRESHOLD", "0.45"))
 LOGPROB_THRESHOLD = float(os.environ.get("PROCOM_MLX_LOGPROB_THRESHOLD", "-0.7"))
 COMPRESSION_RATIO_THRESHOLD = float(os.environ.get("PROCOM_MLX_COMPRESSION_RATIO_THRESHOLD", "2.2"))
+TARGET_RMS = float(os.environ.get("PROCOM_MLX_TARGET_RMS", "0.015"))
+MAX_GAIN = float(os.environ.get("PROCOM_MLX_MAX_GAIN", "16"))
+RAW_RMS_FLOOR = float(os.environ.get("PROCOM_MLX_RAW_RMS_FLOOR", "0.00008"))
+CONDITION_ON_PREVIOUS_TEXT = os.environ.get("PROCOM_MLX_CONDITION_ON_PREVIOUS_TEXT", "true").strip().lower() in ("1", "true", "yes", "on")
 
 LANGUAGE_ALIASES = {
     "en": "en",
     "english": "en",
-    "no": "no",
-    "nb": "no",
-    "nn": "no",
+    "no": "nb",
+    "nb": "nb",
+    "nn": "nb",
     "norwegian": "no",
     "norsk": "no",
 }
 
-PARTIAL_INTERVAL_SECONDS = int(os.environ.get("PROCOM_MLX_PARTIAL_INTERVAL_SECONDS", "4"))
-FINAL_WINDOW_SECONDS = int(os.environ.get("PROCOM_MLX_FINAL_WINDOW_SECONDS", "12"))
-MAX_BUFFER_SECONDS = int(os.environ.get("PROCOM_MLX_MAX_BUFFER_SECONDS", "20"))
+PARTIAL_INTERVAL_SECONDS = int(os.environ.get("PROCOM_MLX_PARTIAL_INTERVAL_SECONDS", "1"))
+FINAL_WINDOW_SECONDS = int(os.environ.get("PROCOM_MLX_FINAL_WINDOW_SECONDS", "5"))
+MAX_BUFFER_SECONDS = int(os.environ.get("PROCOM_MLX_MAX_BUFFER_SECONDS", "12"))
 
 
 class ChannelState:
@@ -68,6 +73,38 @@ def normalize_language(value):
     if not key:
         return ""
     return LANGUAGE_ALIASES.get(key, key)
+
+
+def strip_repeated_speaker_labels(text):
+    normalized = str(text or "").strip()
+    if not normalized:
+        return ""
+
+    # Remove leading diarization-like labels repeated by the model, e.g. "Speaker 1 Speaker 1 ...".
+    cleaned = re.sub(r"^(?:speaker\s*\d+\s+){2,}", "", normalized, flags=re.IGNORECASE).strip()
+    return cleaned or normalized
+
+
+def is_repetitive_speaker_loop(text):
+    normalized = " ".join(str(text or "").strip().lower().split())
+    if not normalized:
+        return False
+
+    if re.fullmatch(r"(?:speaker\s*\d+)(?:\s+speaker\s*\d+){3,}", normalized):
+        return True
+
+    words = normalized.split()
+    if len(words) < 8:
+        return False
+
+    # Generic short-loop detector for repetitive junk output.
+    for size in (1, 2, 3):
+        if len(words) % size != 0:
+            continue
+        pattern = words[:size]
+        if pattern * (len(words) // size) == words:
+            return True
+    return False
 
 
 def run_transcribe_with_fallback(normalized_audio, kwargs):
@@ -137,12 +174,17 @@ def transcribe_channel(channel_id, final):
     try:
         # Pass raw float32 audio directly to avoid runtime ffmpeg dependency.
         normalized = np.clip(audio, -1.0, 1.0).astype(np.float32)
+        current_rms = float(np.sqrt(np.mean(np.square(normalized)))) if normalized.size > 0 else 0.0
+        gain = 1.0
+        if current_rms > 0 and TARGET_RMS > 0 and current_rms < TARGET_RMS:
+            gain = min(MAX_GAIN, TARGET_RMS / current_rms)
+            normalized = np.clip(normalized * gain, -1.0, 1.0).astype(np.float32)
         language = normalize_language(state.language or DEFAULT_LANGUAGE)
         kwargs = {
             "path_or_hf_repo": MODEL,
             "task": TASK,
             "temperature": TEMPERATURE,
-            "condition_on_previous_text": True,
+            "condition_on_previous_text": CONDITION_ON_PREVIOUS_TEXT,
         }
         # Greedy decoding defaults are safest across mlx_whisper variants.
         if BEST_OF > 1:
@@ -157,11 +199,12 @@ def transcribe_channel(channel_id, final):
         kwargs["no_speech_threshold"] = NO_SPEECH_THRESHOLD
         kwargs["logprob_threshold"] = LOGPROB_THRESHOLD
         kwargs["compression_ratio_threshold"] = COMPRESSION_RATIO_THRESHOLD
-        log(f"infer start channel={channel_id} samples={normalized.size} sample_rate={sample_rate} final={final} language={language or 'auto'} model={MODEL}")
+        log(f"infer start channel={channel_id} samples={normalized.size} sample_rate={sample_rate} final={final} language={language or 'auto'} model={MODEL} rms={current_rms:.6f} gain={gain:.2f}")
         started = time.time()
         result, effective_kwargs = run_transcribe_with_fallback(normalized, kwargs)
         elapsed_ms = int((time.time() - started) * 1000)
         text = (result.get("text") or "").strip()
+        text = strip_repeated_speaker_labels(text)
         segments = result.get("segments") or []
         avg_logprob = None
         no_speech_prob = None
@@ -178,18 +221,37 @@ def transcribe_channel(channel_id, final):
                 compression_ratio = float(max(compression_values))
 
         if final and text:
+            if is_repetitive_speaker_loop(text):
+                log(f"infer filtered repetitive-loop channel={channel_id} text={text!r}")
+                return
+
             low_confidence = avg_logprob is not None and avg_logprob < LOGPROB_THRESHOLD
             likely_silence = no_speech_prob is not None and no_speech_prob > NO_SPEECH_THRESHOLD
             likely_hallucination = compression_ratio is not None and compression_ratio > COMPRESSION_RATIO_THRESHOLD
-            if likely_hallucination or low_confidence or (likely_silence and len(text) < 12):
+            too_quiet = current_rms < RAW_RMS_FLOOR
+
+            suspicious_signals = 0
+            if low_confidence:
+                suspicious_signals += 1
+            if likely_silence:
+                suspicious_signals += 1
+            if likely_hallucination:
+                suspicious_signals += 1
+            if too_quiet:
+                suspicious_signals += 1
+
+            # Fail open for live production use: drop only when several quality signals agree.
+            if suspicious_signals >= 3 and len(text) < 24:
                 log(
-                    "infer filtered channel={} final={} text_len={} avg_logprob={} no_speech_prob={} compression_ratio={}".format(
+                    "infer filtered channel={} final={} text_len={} signals={} avg_logprob={} no_speech_prob={} compression_ratio={} rms={}".format(
                         channel_id,
                         final,
                         len(text),
+                        suspicious_signals,
                         avg_logprob,
                         no_speech_prob,
                         compression_ratio,
+                        current_rms,
                     )
                 )
                 return

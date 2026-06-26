@@ -200,6 +200,161 @@ func TestManagerPublishesPunctuatedFinalImmediately(t *testing.T) {
 	}
 }
 
+func TestManagerClearsPartialWhenDuplicateFinalIsSuppressed(t *testing.T) {
+	t.Parallel()
+
+	bus, err := events.NewBus(64)
+	if err != nil {
+		t.Fatalf("new bus: %v", err)
+	}
+	subscription, err := bus.Subscribe()
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer subscription.Close()
+
+	engine := newFakeEngine()
+	manager, err := NewManager(config.Config{Speech: config.SpeechConfig{Enabled: true, Engine: "mlx_whisper"}}, bus, log.New(io.Discard, "", 0), func(config.SpeechConfig, *log.Logger) (Engine, error) {
+		return engine, nil
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := manager.Start(ctx); err != nil {
+		t.Fatalf("start manager: %v", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
+		defer stopCancel()
+		if err := manager.Stop(stopCtx); err != nil {
+			t.Fatalf("stop manager: %v", err)
+		}
+	}()
+
+	engine.results <- Result{ChannelID: "producer", Text: "Go now on one and clear.", Final: true, ReceivedAt: time.Now().UTC()}
+	_ = waitForSpeechEvent(t, subscription.Events(), EventTypeResultFinal)
+
+	engine.results <- Result{ChannelID: "producer", Text: "go now on one and clear", Final: true, ReceivedAt: time.Now().UTC()}
+	clearPayload := waitForClearedPartial(t, subscription.Events(), "producer")
+	if clearPayload.ChannelID != "producer" || clearPayload.Text != "" || clearPayload.Final {
+		t.Fatalf("clear payload = %#v, want empty non-final producer partial", clearPayload)
+	}
+}
+
+func TestManagerClearsPartialWhenNoiseFinalIsDropped(t *testing.T) {
+	t.Parallel()
+
+	bus, err := events.NewBus(64)
+	if err != nil {
+		t.Fatalf("new bus: %v", err)
+	}
+	subscription, err := bus.Subscribe()
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer subscription.Close()
+
+	engine := newFakeEngine()
+	manager, err := NewManager(config.Config{Speech: config.SpeechConfig{Enabled: true, Engine: "mlx_whisper"}}, bus, log.New(io.Discard, "", 0), func(config.SpeechConfig, *log.Logger) (Engine, error) {
+		return engine, nil
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := manager.Start(ctx); err != nil {
+		t.Fatalf("start manager: %v", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
+		defer stopCancel()
+		if err := manager.Stop(stopCtx); err != nil {
+			t.Fatalf("stop manager: %v", err)
+		}
+	}()
+
+	engine.results <- Result{ChannelID: "producer", Text: "stand by for deck two now and hold", Final: true, ReceivedAt: time.Now().UTC()}
+	_ = waitForSpeechEvent(t, subscription.Events(), EventTypeResultFinal)
+
+	engine.results <- Result{ChannelID: "producer", Text: "a", Final: true, ReceivedAt: time.Now().UTC()}
+	clearPayload := waitForClearedPartial(t, subscription.Events(), "producer")
+	if clearPayload.ChannelID != "producer" || clearPayload.Text != "" || clearPayload.Final {
+		t.Fatalf("clear payload = %#v, want empty non-final producer partial", clearPayload)
+	}
+}
+
+func TestManagerAllowsSingleWordFinalCue(t *testing.T) {
+	t.Parallel()
+
+	bus, err := events.NewBus(64)
+	if err != nil {
+		t.Fatalf("new bus: %v", err)
+	}
+	subscription, err := bus.Subscribe()
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer subscription.Close()
+
+	engine := newFakeEngine()
+	manager, err := NewManager(config.Config{Speech: config.SpeechConfig{Enabled: true, Engine: "mlx_whisper"}}, bus, log.New(io.Discard, "", 0), func(config.SpeechConfig, *log.Logger) (Engine, error) {
+		return engine, nil
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := manager.Start(ctx); err != nil {
+		t.Fatalf("start manager: %v", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
+		defer stopCancel()
+		if err := manager.Stop(stopCtx); err != nil {
+			t.Fatalf("stop manager: %v", err)
+		}
+	}()
+
+	engine.results <- Result{ChannelID: "producer", Text: "Go", Final: true, ReceivedAt: time.Now().UTC()}
+	event := waitForSpeechEvent(t, subscription.Events(), EventTypeResultFinal)
+	result, ok := event.Payload.(Result)
+	if !ok {
+		t.Fatalf("payload type = %T, want Result", event.Payload)
+	}
+	if result.Text != "Go" {
+		t.Fatalf("result text = %q, want %q", result.Text, "Go")
+	}
+}
+
+func waitForClearedPartial(t *testing.T, eventsCh <-chan events.Event, channelID string) Result {
+	t.Helper()
+	timeout := time.After(5 * time.Second)
+	for {
+		select {
+		case <-timeout:
+			t.Fatalf("timed out waiting for cleared partial channel=%q", channelID)
+		case event := <-eventsCh:
+			if event.Type != EventTypeResultPartial {
+				continue
+			}
+			result, ok := event.Payload.(Result)
+			if !ok {
+				t.Fatalf("payload type = %T, want Result", event.Payload)
+			}
+			if result.ChannelID == channelID && result.Text == "" && !result.Final {
+				return result
+			}
+		}
+	}
+}
+
 type fakeEngine struct {
 	results   chan Result
 	errors    chan error

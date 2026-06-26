@@ -22,11 +22,27 @@ struct ChunkDescriptor: Codable {
     let capturedAt: String
 }
 
+func maxInputChannels(for device: AVCaptureDevice) -> Int {
+    var maxChannels = 1
+    for format in device.formats {
+        guard let streamDescriptionPointer = CMAudioFormatDescriptionGetStreamBasicDescription(format.formatDescription) else {
+            continue
+        }
+        let channels = max(1, Int(streamDescriptionPointer.pointee.mChannelsPerFrame))
+        if channels > maxChannels {
+            maxChannels = channels
+        }
+    }
+    return maxChannels
+}
+
 final class CaptureDelegate: NSObject, AVCaptureAudioDataOutputSampleBufferDelegate {
     private let encoder = JSONEncoder()
     private let formatter = ISO8601DateFormatter()
+    private let selectedChannelIndex: Int?
 
-    override init() {
+    init(selectedChannelIndex: Int?) {
+        self.selectedChannelIndex = selectedChannelIndex
         super.init()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
     }
@@ -125,25 +141,35 @@ final class CaptureDelegate: NSObject, AVCaptureAudioDataOutputSampleBufferDeleg
                 return
             }
             frames = Array(repeating: 0, count: frameCount)
-            for frameIndex in 0..<frameCount {
-                var sum: Float = 0
-                for channelIndex in 0..<channelCount {
-                    sum += interleaved[(frameIndex * channelCount) + channelIndex]
+            if let selectedChannelIndex, selectedChannelIndex >= 0, selectedChannelIndex < channelCount {
+                for frameIndex in 0..<frameCount {
+                    frames[frameIndex] = interleaved[(frameIndex * channelCount) + selectedChannelIndex]
                 }
-                frames[frameIndex] = sum / Float(channelCount)
+            } else {
+                for frameIndex in 0..<frameCount {
+                    var sum: Float = 0
+                    for channelIndex in 0..<channelCount {
+                        sum += interleaved[(frameIndex * channelCount) + channelIndex]
+                    }
+                    frames[frameIndex] = sum / Float(channelCount)
+                }
             }
         } else if channels.count > 1 {
             let frameCount = channels.map { $0.count }.min() ?? 0
             if frameCount == 0 {
                 return
             }
-            frames = Array(repeating: 0, count: frameCount)
-            for frameIndex in 0..<frameCount {
-                var sum: Float = 0
-                for channel in channels {
-                    sum += channel[frameIndex]
+            if let selectedChannelIndex, selectedChannelIndex >= 0, selectedChannelIndex < channels.count {
+                frames = channels[selectedChannelIndex]
+            } else {
+                frames = Array(repeating: 0, count: frameCount)
+                for frameIndex in 0..<frameCount {
+                    var sum: Float = 0
+                    for channel in channels {
+                        sum += channel[frameIndex]
+                    }
+                    frames[frameIndex] = sum / Float(channels.count)
                 }
-                frames[frameIndex] = sum / Float(channels.count)
             }
         } else {
             frames = channels[0]
@@ -166,7 +192,21 @@ guard arguments.count >= 2 else {
 
 switch arguments[1] {
 case "list":
-    let devices = availableAudioDevices().map { DeviceDescriptor(id: $0.uniqueID, name: $0.localizedName) }
+    var devices: [DeviceDescriptor] = []
+    for device in availableAudioDevices() {
+        let channelCount = maxInputChannels(for: device)
+        devices.append(DeviceDescriptor(id: device.uniqueID, name: device.localizedName))
+        if channelCount > 1 {
+            for channel in 1...channelCount {
+                devices.append(
+                    DeviceDescriptor(
+                        id: "\(device.uniqueID)::ch:\(channel)",
+                        name: "\(device.localizedName) CH \(channel)"
+                    )
+                )
+            }
+        }
+    }
     let encoder = JSONEncoder()
     encoder.outputFormatting = [.prettyPrinted]
     let payload = try encoder.encode(devices)
@@ -174,12 +214,18 @@ case "list":
 
 case "capture":
     guard arguments.count >= 5 else {
-        fputs("usage: apple_audio_helper.swift capture <device-id> <sample-rate> <frames-per-buffer>\n", stderr)
+        fputs("usage: apple_audio_helper.swift capture <device-id> <sample-rate> <frames-per-buffer> [channel-index-1-based]\n", stderr)
         exit(1)
     }
 
     let deviceID = arguments[2]
     let sampleRate = Int(arguments[3]) ?? 16000
+    let selectedChannelIndex: Int? = {
+        guard arguments.count >= 6, let channel = Int(arguments[5]), channel > 0 else {
+            return nil
+        }
+        return channel - 1
+    }()
 
     guard let device = availableAudioDevices().first(where: { $0.uniqueID == deviceID }) else {
         fputs("audio device not found: \(deviceID)\n", stderr)
@@ -205,9 +251,8 @@ case "capture":
         AVLinearPCMIsFloatKey: true,
         AVLinearPCMBitDepthKey: 32,
         AVLinearPCMIsNonInterleaved: false,
-        AVNumberOfChannelsKey: 1,
     ]
-    let delegate = CaptureDelegate()
+    let delegate = CaptureDelegate(selectedChannelIndex: selectedChannelIndex)
     let queue = DispatchQueue(label: "procom.audio.capture")
     output.setSampleBufferDelegate(delegate, queue: queue)
     if session.canAddOutput(output) {

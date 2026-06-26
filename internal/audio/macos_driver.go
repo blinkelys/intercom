@@ -13,6 +13,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -75,12 +77,38 @@ func (d *MacOSDriver) OpenStream(_ context.Context, cfg StreamConfig) (Stream, e
 	if err != nil {
 		return nil, err
 	}
+	helperDeviceID, selectedChannel := parseHelperDeviceSelection(cfg.DeviceID)
 	return &macOSStream{
 		logger:     d.logger,
 		helperPath: helperPath,
 		config:     cfg,
+		helperID:   helperDeviceID,
+		channel:    selectedChannel,
 		chunks:     make(chan SampleChunk, 16),
 	}, nil
+}
+
+func parseHelperDeviceSelection(deviceID string) (string, int) {
+	const suffix = "::ch:"
+	trimmed := strings.TrimSpace(deviceID)
+	if trimmed == "" {
+		return "", 0
+	}
+	index := strings.LastIndex(trimmed, suffix)
+	if index < 0 {
+		return trimmed, 0
+	}
+
+	baseID := strings.TrimSpace(trimmed[:index])
+	channelPart := strings.TrimSpace(trimmed[index+len(suffix):])
+	channel, err := strconv.Atoi(channelPart)
+	if err != nil || channel <= 0 {
+		return trimmed, 0
+	}
+	if baseID == "" {
+		return trimmed, 0
+	}
+	return baseID, channel
 }
 
 func (d *MacOSDriver) materializeHelper() (string, error) {
@@ -111,6 +139,8 @@ type macOSStream struct {
 	logger     *log.Logger
 	helperPath string
 	config     StreamConfig
+	helperID   string
+	channel    int
 	chunks     chan SampleChunk
 
 	mu      sync.Mutex
@@ -136,10 +166,13 @@ func (s *macOSStream) Start(ctx context.Context) error {
 		"swift",
 		s.helperPath,
 		"capture",
-		s.config.DeviceID,
+		s.helperID,
 		fmt.Sprintf("%d", s.config.SampleRate),
 		fmt.Sprintf("%d", s.config.FramesPerBuffer),
 	)
+	if s.channel > 0 {
+		cmd.Args = append(cmd.Args, fmt.Sprintf("%d", s.channel))
+	}
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		cancel()

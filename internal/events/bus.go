@@ -43,19 +43,13 @@ func NewBus(size int) (*Bus, error) {
 // Publish attempts to enqueue an event for each subscriber without blocking callers indefinitely.
 func (b *Bus) Publish(event Event) bool {
 	b.mu.RLock()
+	defer b.mu.RUnlock()
 	if b.closed {
-		b.mu.RUnlock()
 		return false
 	}
 
-	subscribers := make([]chan Event, 0, len(b.subscribers))
-	for _, subscriber := range b.subscribers {
-		subscribers = append(subscribers, subscriber)
-	}
-	b.mu.RUnlock()
-
 	delivered := true
-	for _, subscriber := range subscribers {
+	for _, subscriber := range b.subscribers {
 		select {
 		case subscriber <- event:
 		default:

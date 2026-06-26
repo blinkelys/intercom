@@ -5,9 +5,11 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
+	"procom/internal/channels"
 	"procom/internal/config"
 	"procom/internal/events"
 	"procom/internal/keywords"
@@ -159,6 +161,13 @@ func (m *Manager) Partials() map[string]Partial {
 	return m.Snapshot().Partials
 }
 
+// UpdateKeywords replaces keyword matching rules at runtime.
+func (m *Manager) UpdateKeywords(rules []config.KeywordConfig) {
+	m.mu.Lock()
+	m.matcher = keywords.NewMatcher(rules)
+	m.mu.Unlock()
+}
+
 func (m *Manager) consume(ctx context.Context, subscription *events.Subscription) {
 	defer close(m.workerDone)
 
@@ -185,6 +194,31 @@ func (m *Manager) consume(ctx context.Context, subscription *events.Subscription
 					continue
 				}
 				m.applyFinal(result)
+			case channels.EventTypeUpdated:
+				update, ok := event.Payload.(channels.Update)
+				if !ok {
+					continue
+				}
+				m.mu.Lock()
+				m.channels[update.Channel.ID] = config.ChannelConfig{
+					ID:          update.Channel.ID,
+					Name:        update.Channel.Name,
+					Color:       update.Channel.Color,
+					Icon:        update.Channel.Icon,
+					InputDevice: update.Channel.InputDevice,
+					Language:    update.Channel.Language,
+					Enabled:     update.Channel.Enabled,
+				}
+				m.mu.Unlock()
+			case channels.EventTypeDeleted:
+				deleted, ok := event.Payload.(channels.Deleted)
+				if !ok {
+					continue
+				}
+				m.mu.Lock()
+				delete(m.channels, deleted.ChannelID)
+				delete(m.partials, deleted.ChannelID)
+				m.mu.Unlock()
 			}
 		}
 	}
@@ -194,6 +228,14 @@ func (m *Manager) applyPartial(result speech.Result) {
 	timestamp := result.ReceivedAt
 	if timestamp.IsZero() {
 		timestamp = time.Now().UTC()
+	}
+
+	if strings.TrimSpace(result.Text) == "" {
+		m.mu.Lock()
+		delete(m.partials, result.ChannelID)
+		m.mu.Unlock()
+		m.publishUpdate("partial", result.ChannelID, "", timestamp)
+		return
 	}
 
 	partial := Partial{

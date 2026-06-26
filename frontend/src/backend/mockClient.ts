@@ -1,9 +1,12 @@
 import type { BackendClient, BackendSubscription } from './client'
 import type {
   BootstrapPayload,
+  ChannelAddInput,
   ChannelView,
   ChannelUpdateInput,
   InputDeviceView,
+  KeywordRuleView,
+  OscSettingsView,
   SpeechDiagnosticsView,
   SubscriptionPayload,
   TranscriptEntryView,
@@ -12,8 +15,8 @@ import type {
 } from '../types'
 
 const initialChannels: ChannelView[] = [
-  { id: 'producer', name: 'Producer', color: '#ef4444', icon: '🎬', inputDevice: 'Input 1', language: 'en', enabled: true },
-  { id: 'musical-director', name: 'Musical Director', color: '#22c55e', icon: '🎼', inputDevice: 'Input 2', language: 'en', enabled: true },
+  { id: 'producer', name: 'Producer', color: '#ef4444', icon: '🎬', inputDevice: 'Input 1', language: 'en', gainDb: 0, enabled: true },
+  { id: 'musical-director', name: 'Musical Director', color: '#22c55e', icon: '🎼', inputDevice: 'Input 2', language: 'en', gainDb: 0, enabled: true },
 ]
 
 const initialInputDevices: InputDeviceView[] = [
@@ -37,6 +40,31 @@ const initialSpeech: SpeechDiagnosticsView = {
   lastTextChars: 36,
   lastError: '',
   updatedAt: '19:42:10',
+}
+
+const initialKeywords: KeywordRuleView[] = [
+  {
+    phrase: 'Go',
+    highlightColor: '#eab308',
+    wholeWord: true,
+    triggerEnabled: true,
+    oscAddress: '/show/go',
+    oscArguments: ['producer'],
+  },
+  {
+    phrase: 'Stand by',
+    highlightColor: '#22c55e',
+    wholeWord: false,
+    triggerEnabled: false,
+    oscAddress: '',
+    oscArguments: [],
+  },
+]
+
+const initialOsc: OscSettingsView = {
+  enabled: false,
+  destination: '127.0.0.1',
+  port: 9000,
 }
 
 type FeedStep = {
@@ -66,6 +94,8 @@ const feed: FeedStep[] = [
 export class MockBackendClient implements BackendClient {
   private listeners = new Set<(payload: SubscriptionPayload) => void>()
   private channels = [...initialChannels]
+  private keywords = [...initialKeywords]
+  private osc = { ...initialOsc }
   private snapshot: TranscriptSnapshotView = this.createInitialSnapshot()
   private nextEntry = 103
   private timer: number | null = null
@@ -79,6 +109,8 @@ export class MockBackendClient implements BackendClient {
       inputDevices: initialInputDevices,
       audioLevels: {},
       snapshot: this.snapshot,
+      keywords: this.keywords,
+      osc: this.osc,
       speech: initialSpeech,
       status: 'live',
       engineLabel: 'Offline worker bridge',
@@ -88,7 +120,7 @@ export class MockBackendClient implements BackendClient {
 
   subscribe(listener: (payload: SubscriptionPayload) => void): BackendSubscription {
     this.listeners.add(listener)
-    listener({ channels: this.channels, inputDevices: initialInputDevices, audioLevels: {}, snapshot: this.snapshot, speech: initialSpeech, status: 'live' })
+    listener({ channels: this.channels, inputDevices: initialInputDevices, audioLevels: {}, snapshot: this.snapshot, keywords: this.keywords, osc: this.osc, speech: initialSpeech, status: 'live' })
 
     return {
       dispose: () => {
@@ -105,6 +137,7 @@ export class MockBackendClient implements BackendClient {
       icon: input.icon,
       inputDevice: input.inputDevice.trim(),
       language: input.language.trim(),
+      gainDb: input.gainDb,
       enabled: input.enabled,
     }
 
@@ -137,6 +170,41 @@ export class MockBackendClient implements BackendClient {
 
     this.emit()
     return nextChannel
+  }
+
+  async addChannel(input: ChannelAddInput): Promise<ChannelView> {
+    const nextChannel: ChannelView = {
+      id: input.id.trim(),
+      name: input.name.trim(),
+      color: input.color.trim(),
+      icon: input.icon,
+      inputDevice: input.inputDevice.trim(),
+      language: input.language.trim(),
+      gainDb: input.gainDb,
+      enabled: input.enabled,
+    }
+    this.channels = [...this.channels, nextChannel]
+    this.emit()
+    return nextChannel
+  }
+
+  async removeChannel(channelId: string): Promise<void> {
+    this.channels = this.channels.filter((channel) => channel.id !== channelId)
+    this.snapshot = {
+      entries: this.snapshot.entries.filter((entry) => entry.channelId !== channelId),
+      partials: Object.fromEntries(Object.entries(this.snapshot.partials).filter(([id]) => id !== channelId)),
+    }
+    this.emit()
+  }
+
+  async updateKeywords(rules: KeywordRuleView[]): Promise<void> {
+    this.keywords = rules.map((rule) => ({ ...rule, oscArguments: [...rule.oscArguments] }))
+    this.emit()
+  }
+
+  async updateOsc(input: OscSettingsView): Promise<void> {
+    this.osc = { ...input }
+    this.emit()
   }
 
   private startFeed() {
@@ -199,7 +267,7 @@ export class MockBackendClient implements BackendClient {
 
   private emit() {
     for (const listener of this.listeners) {
-      listener({ channels: this.channels, inputDevices: initialInputDevices, audioLevels: {}, snapshot: this.snapshot, speech: initialSpeech, status: 'live' })
+      listener({ channels: this.channels, inputDevices: initialInputDevices, audioLevels: {}, snapshot: this.snapshot, keywords: this.keywords, osc: this.osc, speech: initialSpeech, status: 'live' })
     }
   }
 

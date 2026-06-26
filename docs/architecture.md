@@ -1,4 +1,4 @@
-# PROCOM Architecture
+# INTERCOM Architecture
 
 ## Phase 1 Goals
 

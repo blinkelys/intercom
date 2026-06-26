@@ -5,6 +5,7 @@ export type ChannelView = {
   icon: string
   inputDevice: string
   language: string
+  gainDb: number
   enabled: boolean
 }
 
@@ -22,6 +23,18 @@ export type ChannelUpdateInput = {
   icon: string
   inputDevice: string
   language: string
+  gainDb: number
+  enabled: boolean
+}
+
+export type ChannelAddInput = {
+  id: string
+  name: string
+  color: string
+  icon: string
+  inputDevice: string
+  language: string
+  gainDb: number
   enabled: boolean
 }
 
@@ -74,6 +87,36 @@ export type SpeechDiagnosticsView = {
   updatedAt: string
 }
 
+export type KeywordRuleView = {
+  phrase: string
+  highlightColor: string
+  wholeWord: boolean
+  triggerEnabled: boolean
+  oscAddress: string
+  oscArguments: string[]
+}
+
+export type KeywordRuleInput = {
+  phrase: string
+  highlightColor: string
+  wholeWord: boolean
+  triggerEnabled: boolean
+  oscAddress: string
+  oscArguments: string[]
+}
+
+export type OscSettingsView = {
+  enabled: boolean
+  destination: string
+  port: number
+}
+
+export type OscSettingsInput = {
+  enabled: boolean
+  destination: string
+  port: number
+}
+
 export type RuntimeStatus = 'connecting' | 'live' | 'offline'
 
 export type BootstrapPayload = {
@@ -81,6 +124,8 @@ export type BootstrapPayload = {
   inputDevices: InputDeviceView[]
   audioLevels: AudioLevelsView
   snapshot: TranscriptSnapshotView
+  keywords: KeywordRuleView[]
+  osc: OscSettingsView
   speech: SpeechDiagnosticsView
   status: RuntimeStatus
   engineLabel: string
@@ -92,6 +137,8 @@ export type SubscriptionPayload = {
   inputDevices?: InputDeviceView[]
   audioLevels?: AudioLevelsView
   snapshot?: TranscriptSnapshotView
+  keywords?: KeywordRuleView[]
+  osc?: OscSettingsView
   speech?: SpeechDiagnosticsView
   status?: RuntimeStatus
 }

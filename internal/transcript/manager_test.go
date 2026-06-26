@@ -81,6 +81,61 @@ func TestManagerTracksPartialAndFinalResults(t *testing.T) {
 	}
 }
 
+func TestManagerClearsPartialOnEmptyPartialText(t *testing.T) {
+	t.Parallel()
+
+	bus, err := events.NewBus(16)
+	if err != nil {
+		t.Fatalf("new bus: %v", err)
+	}
+	manager, err := NewManager(config.Config{Channels: []config.ChannelConfig{{ID: "producer", Name: "Producer"}}}, bus, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := manager.Start(ctx); err != nil {
+		t.Fatalf("start manager: %v", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
+		defer stopCancel()
+		if err := manager.Stop(stopCtx); err != nil {
+			t.Fatalf("stop manager: %v", err)
+		}
+	}()
+
+	bustime := time.Now().UTC()
+	bus.Publish(events.Event{Type: speech.EventTypeResultPartial, Payload: speech.Result{ChannelID: "producer", Text: "stand by", ReceivedAt: bustime}})
+
+	deadline := time.After(time.Second)
+	for {
+		if _, ok := manager.Partials()["producer"]; ok {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for initial partial")
+		default:
+		}
+	}
+
+	bus.Publish(events.Event{Type: speech.EventTypeResultPartial, Payload: speech.Result{ChannelID: "producer", Text: "", ReceivedAt: bustime.Add(time.Second)}})
+
+	deadline = time.After(time.Second)
+	for {
+		if _, ok := manager.Partials()["producer"]; !ok {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for partial clear")
+		default:
+		}
+	}
+}
+
 func TestManagerAddsKeywordMetadataToFinalEntries(t *testing.T) {
 	t.Parallel()
 

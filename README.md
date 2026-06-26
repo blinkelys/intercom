@@ -1,6 +1,6 @@
-# PROCOM
+# INTERCOM
 
-PROCOM is an offline desktop transcription tool for live event production.
+INTERCOM is an offline desktop transcription tool for live event production.
 
 ## Current Status
 
@@ -90,6 +90,34 @@ Repo-local Wails CLI wrapper:
 ./scripts/wails.sh doctor
 ./scripts/wails.sh dev
 ```
+
+Accuracy launch profiles:
+
+```bash
+# Balanced laptop testing
+./scripts/run-profile.sh laptop-balanced dev
+
+# Strict laptop mode (higher latency, higher stability)
+./scripts/run-profile.sh laptop-hyper dev
+
+# Production talkback feed mode
+./scripts/run-profile.sh talkback-hyper dev
+```
+
+Available profile env files:
+
+- `scripts/profiles/laptop-balanced.env`
+- `scripts/profiles/laptop-hyper.env`
+- `scripts/profiles/talkback-hyper.env`
+
+### Live Production Accuracy Checklist
+
+1. Use a direct line/talkback feed into your audio interface whenever possible.
+2. Set each channel language explicitly in settings (avoid auto-detection behavior).
+3. Keep gain conservative (avoid clipping) and verify clean peaks before show start.
+4. Confirm the selected input device in settings is the line/talkback source.
+5. Run `./scripts/run-profile.sh talkback-hyper dev` for show mode.
+6. Use laptop profiles only for rehearsal or fallback testing.
 
 The wrapper installs `wails` into `.tools/bin` on first use, so it does not require modifying your global `PATH`.
 

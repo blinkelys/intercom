@@ -4,6 +4,7 @@ import (
 	"context"
 	"io"
 	"log"
+	"strings"
 	"testing"
 	"time"
 
@@ -78,6 +79,124 @@ func TestManagerUpdateRejectsInvalidChannel(t *testing.T) {
 	_, err = manager.Update(UpdateRequest{ID: "producer", Name: "", Color: "#fff", Icon: "🎬", Language: "en", Enabled: true})
 	if err == nil {
 		t.Fatal("expected invalid update to fail")
+	}
+}
+
+func TestManagerAddAndRemoveChannel(t *testing.T) {
+	t.Parallel()
+
+	bus, err := events.NewBus(8)
+	if err != nil {
+		t.Fatalf("new bus: %v", err)
+	}
+	manager, err := NewManager(config.Default(), bus, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	created, err := manager.Add(AddRequest{
+		ID:       "fx",
+		Name:     "Effects",
+		Color:    "#0EA5E9",
+		Icon:     "🎛",
+		Language: "en",
+		Enabled:  true,
+	})
+	if err != nil {
+		t.Fatalf("add channel: %v", err)
+	}
+	if created.ID != "fx" {
+		t.Fatalf("created id = %q, want fx", created.ID)
+	}
+
+	if err := manager.Remove("fx"); err != nil {
+		t.Fatalf("remove channel: %v", err)
+	}
+
+	for _, channel := range manager.Snapshot().Channels {
+		if channel.ID == "fx" {
+			t.Fatal("expected removed channel to be absent")
+		}
+	}
+}
+
+func TestManagerAddRejectsDuplicateName(t *testing.T) {
+	t.Parallel()
+
+	bus, err := events.NewBus(4)
+	if err != nil {
+		t.Fatalf("new bus: %v", err)
+	}
+	manager, err := NewManager(config.Default(), bus, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	_, err = manager.Add(AddRequest{
+		ID:       "producer-2",
+		Name:     "Producer",
+		Color:    "#0EA5E9",
+		Icon:     "🎛",
+		Language: "en",
+		Enabled:  true,
+	})
+	if err == nil {
+		t.Fatal("expected duplicate name to fail")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "name") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestManagerUpdateRejectsDuplicateName(t *testing.T) {
+	t.Parallel()
+
+	bus, err := events.NewBus(4)
+	if err != nil {
+		t.Fatalf("new bus: %v", err)
+	}
+	manager, err := NewManager(config.Default(), bus, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	_, err = manager.Update(UpdateRequest{
+		ID:       "musical-director",
+		Name:     "Producer",
+		Color:    "#22c55e",
+		Icon:     "🎼",
+		Language: "en",
+		Enabled:  true,
+	})
+	if err == nil {
+		t.Fatal("expected duplicate name to fail")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "name") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+}
+
+func TestManagerRemoveRejectsLastChannel(t *testing.T) {
+	t.Parallel()
+
+	cfg := config.Default()
+	cfg.Channels = []config.ChannelConfig{cfg.Channels[0]}
+
+	bus, err := events.NewBus(4)
+	if err != nil {
+		t.Fatalf("new bus: %v", err)
+	}
+	manager, err := NewManager(cfg, bus, log.New(io.Discard, "", 0))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	err = manager.Remove(cfg.Channels[0].ID)
+	if err == nil {
+		t.Fatal("expected removing last channel to fail")
+	}
+	if !strings.Contains(strings.ToLower(err.Error()), "at least one") {
+		t.Fatalf("unexpected error: %v", err)
 	}
 }
 

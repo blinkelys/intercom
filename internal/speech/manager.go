@@ -71,12 +71,12 @@ type bufferedSentence struct {
 
 const (
 	sentenceFlushTick      = 300 * time.Millisecond
-	defaultSentenceMaxWait = 2500 * time.Millisecond
-	defaultMinWords        = 10
-	defaultMinPunctWords   = 5
-	defaultMinChunkRMS     = 0.012
-	defaultMinFinalChars   = 6
-	maxPromptChars         = 240
+	defaultSentenceMaxWait = 1400 * time.Millisecond
+	defaultMinWords        = 8
+	defaultMinPunctWords   = 4
+	defaultMinChunkRMS     = 0.00002
+	defaultMinFinalChars   = 2
+	maxPromptChars         = 520
 	maxContextChars        = 160
 	maxKeywordHints        = 12
 )
@@ -347,7 +347,7 @@ func (m *Manager) consumeAudioEvents(ctx context.Context, subscription *events.S
 				pendingRate[chunk.ChannelID] = chunk.SampleRate
 				pendingCapturedAt[chunk.ChannelID] = chunk.CapturedAt
 
-				flushThreshold := chunk.SampleRate / 4 // ~250ms batches for lower worker IPC pressure.
+				flushThreshold := chunk.SampleRate / 6 // ~167ms batches for lower recognition latency.
 				if flushThreshold < 1024 {
 					flushThreshold = 1024
 				}
@@ -405,10 +405,35 @@ func (m *Manager) buildPrompt(channelID string) string {
 	m.mu.Lock()
 	contextText := m.recentContext[channelID]
 	m.mu.Unlock()
+	language := strings.ToLower(strings.TrimSpace(m.channelLanguage[channelID]))
+	channelName := strings.ToLower(strings.TrimSpace(m.channelName[channelID]))
 
-	parts := make([]string, 0, 3)
+	parts := make([]string, 0, 5)
+	if language == "no" || language == "nb" || language == "nn" {
+		parts = append(parts, "Transkriber ordrett pa norsk. Ikke oversett til engelsk.")
+	} else {
+		parts = append(parts, "Transcribe exactly in the spoken language. Do not translate.")
+	}
 	if name := strings.TrimSpace(m.channelName[channelID]); name != "" {
-		parts = append(parts, "Speaker channel: "+name+".")
+		if language == "no" || language == "nb" || language == "nn" {
+			parts = append(parts, "Kildekanal: "+name+".")
+		} else {
+			parts = append(parts, "Source channel: "+name+".")
+		}
+	}
+	if language != "" {
+		parts = append(parts, "Target language: "+languageLabel(language)+".")
+	}
+	if language == "no" || language == "nb" || language == "nn" {
+		parts = append(parts, "Behold korte cue-ord nøyaktig slik de sies. I dette domenet er 'tag' et cue-ord og skal forbli 'tag'.")
+	}
+	if strings.Contains(channelName, "musical") || strings.Contains(channelName, "director") || strings.Contains(channelName, "md") {
+		if language == "no" || language == "nb" || language == "nn" {
+			parts = append(parts, "Musical-direction vocabulary: vers, refreng, bridge, intro, outro, takt, takter, opptakt, innsatser, monitor, mer i monitor, mindre i monitor, klikk, piano, gitar, bass, trommer, kor.")
+			parts = append(parts, "Keep numbers and counts literal in Norwegian: en, to, tre, fire, fem, seks, sju, aatte.")
+		} else {
+			parts = append(parts, "Musical-direction vocabulary: verse, chorus, bridge, intro, outro, count, bars, pickup, entry, monitor, more in monitor, less in monitor, click, piano, guitar, bass, drums, vocals.")
+		}
 	}
 	if hints := strings.TrimSpace(m.keywordHints); hints != "" {
 		parts = append(parts, hints)
@@ -524,8 +549,10 @@ func (m *Manager) consumeResults(ctx context.Context, engine Engine) {
 			return
 		}
 		if previous := lastEmitted[channelID]; previous != "" {
-			if normalized == previous || strings.Contains(normalized, previous) || strings.Contains(previous, normalized) {
+			if normalized == previous {
 				delete(pending, channelID)
+				m.logger.Printf("speech manager suppress duplicate final channel=%s text=%q", channelID, result.Text)
+				m.publishPartialClear(channelID)
 				return
 			}
 		}
@@ -580,11 +607,14 @@ func (m *Manager) consumeResults(ctx context.Context, engine Engine) {
 			}
 			if m.isLikelyNoiseFinal(result.Text) {
 				m.logger.Printf("speech manager drop low-signal final channel=%s text=%q", result.ChannelID, strings.TrimSpace(result.Text))
+				m.publishPartialClear(result.ChannelID)
 				continue
 			}
 
 			combined := mergeSentenceText(pending[result.ChannelID].text, result.Text)
 			if combined == "" {
+				m.logger.Printf("speech manager drop empty-merge final channel=%s text=%q", result.ChannelID, strings.TrimSpace(result.Text))
+				m.publishPartialClear(result.ChannelID)
 				continue
 			}
 
@@ -607,6 +637,15 @@ func (m *Manager) consumeResults(ctx context.Context, engine Engine) {
 			m.bus.Publish(events.Event{Type: EventTypeResultPartial, Payload: preview})
 		}
 	}
+}
+
+func (m *Manager) publishPartialClear(channelID string) {
+	m.bus.Publish(events.Event{Type: EventTypeResultPartial, Payload: Result{
+		ChannelID:  channelID,
+		Text:       "",
+		Final:      false,
+		ReceivedAt: time.Now().UTC(),
+	}})
 }
 
 func mergeSentenceText(existing string, next string) string {
@@ -648,16 +687,11 @@ func (m *Manager) isClearSentence(text string) bool {
 func (m *Manager) isLikelyNoiseFinal(text string) bool {
 	normalized := strings.Join(strings.Fields(text), " ")
 	if normalized == "" {
+		m.logger.Printf("speech manager noise-final reason=empty")
 		return true
 	}
 	if len(normalized) < m.minFinalChars {
-		return true
-	}
-	words := strings.Fields(normalized)
-	if len(words) == 1 && len(words[0]) <= 2 {
-		return true
-	}
-	if len(words) == 1 && !hasSentencePunctuation(normalized) {
+		m.logger.Printf("speech manager noise-final reason=too-short chars=%d threshold=%d text=%q", len(normalized), m.minFinalChars, normalized)
 		return true
 	}
 	return false
@@ -676,6 +710,20 @@ func hasSentencePunctuation(text string) bool {
 	}
 	last := trimmed[len(trimmed)-1]
 	return last == '.' || last == '!' || last == '?'
+}
+
+func languageLabel(language string) string {
+	switch strings.ToLower(strings.TrimSpace(language)) {
+	case "no", "nb", "nn":
+		return "Norwegian"
+	case "en":
+		return "English"
+	default:
+		if language == "" {
+			return ""
+		}
+		return language
+	}
 }
 
 func (m *Manager) consumeErrors(ctx context.Context, engine Engine) {

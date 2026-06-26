@@ -26,13 +26,14 @@ type SpeechConfig struct {
 
 // ChannelConfig defines one communication channel.
 type ChannelConfig struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Color       string `json:"color"`
-	Icon        string `json:"icon"`
-	InputDevice string `json:"inputDevice"`
-	Language    string `json:"language"`
-	Enabled     bool   `json:"enabled"`
+	ID          string  `json:"id"`
+	Name        string  `json:"name"`
+	Color       string  `json:"color"`
+	Icon        string  `json:"icon"`
+	InputDevice string  `json:"inputDevice"`
+	Language    string  `json:"language"`
+	GainDB      float64 `json:"gainDb"`
+	Enabled     bool    `json:"enabled"`
 }
 
 // KeywordConfig defines one keyword rule.
@@ -88,6 +89,13 @@ func Default() Config {
 
 // Validate ensures the configuration is internally consistent.
 func (c Config) Validate() error {
+	if len(c.Channels) == 0 {
+		return fmt.Errorf("at least one channel is required")
+	}
+	if len(c.Channels) > 8 {
+		return fmt.Errorf("a maximum of 8 channels is supported")
+	}
+
 	seenChannelIDs := make(map[string]struct{}, len(c.Channels))
 	for _, channel := range c.Channels {
 		if strings.TrimSpace(channel.ID) == "" {
@@ -98,6 +106,9 @@ func (c Config) Validate() error {
 		}
 		if _, exists := seenChannelIDs[channel.ID]; exists {
 			return fmt.Errorf("duplicate channel id %q", channel.ID)
+		}
+		if channel.GainDB < -24 || channel.GainDB > 36 {
+			return fmt.Errorf("channel %q gainDb %.2f is out of range (-24..36)", channel.ID, channel.GainDB)
 		}
 		seenChannelIDs[channel.ID] = struct{}{}
 	}

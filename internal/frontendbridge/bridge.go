@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -12,11 +13,12 @@ import (
 	"procom/internal/channels"
 	"procom/internal/config"
 	"procom/internal/events"
+	"procom/internal/osc"
 	"procom/internal/speech"
 	"procom/internal/transcript"
 )
 
-const EventName = "procom:state"
+const EventName = "intercom:state"
 
 // Emitter pushes frontend subscription payloads into an attached desktop transport.
 type Emitter interface {
@@ -24,13 +26,14 @@ type Emitter interface {
 }
 
 type Channel struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Color       string `json:"color"`
-	Icon        string `json:"icon"`
-	InputDevice string `json:"inputDevice"`
-	Language    string `json:"language"`
-	Enabled     bool   `json:"enabled"`
+	ID          string  `json:"id"`
+	Name        string  `json:"name"`
+	Color       string  `json:"color"`
+	Icon        string  `json:"icon"`
+	InputDevice string  `json:"inputDevice"`
+	Language    string  `json:"language"`
+	GainDB      float64 `json:"gainDb"`
+	Enabled     bool    `json:"enabled"`
 }
 
 type Highlight struct {
@@ -72,6 +75,8 @@ type BootstrapPayload struct {
 	InputDevices []Device          `json:"inputDevices"`
 	AudioLevels  Levels            `json:"audioLevels"`
 	Snapshot     Snapshot          `json:"snapshot"`
+	Keywords     []KeywordRule     `json:"keywords"`
+	OSC          OSCSettings       `json:"osc"`
 	Speech       SpeechDiagnostics `json:"speech"`
 	Status       string            `json:"status"`
 	EngineLabel  string            `json:"engineLabel"`
@@ -95,13 +100,40 @@ type Device struct {
 }
 
 type ChannelUpdateInput struct {
-	ID          string `json:"id"`
-	Name        string `json:"name"`
-	Color       string `json:"color"`
-	Icon        string `json:"icon"`
-	InputDevice string `json:"inputDevice"`
-	Language    string `json:"language"`
+	ID          string  `json:"id"`
+	Name        string  `json:"name"`
+	Color       string  `json:"color"`
+	Icon        string  `json:"icon"`
+	InputDevice string  `json:"inputDevice"`
+	Language    string  `json:"language"`
+	GainDB      float64 `json:"gainDb"`
+	Enabled     bool    `json:"enabled"`
+}
+
+type ChannelAddInput struct {
+	ID          string  `json:"id"`
+	Name        string  `json:"name"`
+	Color       string  `json:"color"`
+	Icon        string  `json:"icon"`
+	InputDevice string  `json:"inputDevice"`
+	Language    string  `json:"language"`
+	GainDB      float64 `json:"gainDb"`
+	Enabled     bool    `json:"enabled"`
+}
+
+type KeywordRuleInput struct {
+	Phrase         string   `json:"phrase"`
+	HighlightColor string   `json:"highlightColor"`
+	WholeWord      bool     `json:"wholeWord"`
+	TriggerEnabled bool     `json:"triggerEnabled"`
+	OSCAddress     string   `json:"oscAddress"`
+	OSCArguments   []string `json:"oscArguments"`
+}
+
+type OSCSettingsInput struct {
 	Enabled     bool   `json:"enabled"`
+	Destination string `json:"destination"`
+	Port        int    `json:"port"`
 }
 
 type SpeechDiagnostics struct {
@@ -119,6 +151,21 @@ type SpeechDiagnostics struct {
 	UpdatedAt        string            `json:"updatedAt"`
 }
 
+type KeywordRule struct {
+	Phrase         string   `json:"phrase"`
+	HighlightColor string   `json:"highlightColor"`
+	WholeWord      bool     `json:"wholeWord"`
+	TriggerEnabled bool     `json:"triggerEnabled"`
+	OSCAddress     string   `json:"oscAddress"`
+	OSCArguments   []string `json:"oscArguments"`
+}
+
+type OSCSettings struct {
+	Enabled     bool   `json:"enabled"`
+	Destination string `json:"destination"`
+	Port        int    `json:"port"`
+}
+
 // Bridge exposes Wails-bindable methods and live update emission for the frontend.
 type Bridge struct {
 	config     config.Config
@@ -126,8 +173,11 @@ type Bridge struct {
 	logger     *log.Logger
 	channels   *channels.Manager
 	audio      *audio.Manager
+	osc        *osc.Manager
 	speech     *speech.Manager
 	transcript *transcript.Manager
+	keywords   []config.KeywordConfig
+	oscConfig  config.OSCConfig
 
 	mu           sync.RWMutex
 	emitter      Emitter
@@ -137,7 +187,7 @@ type Bridge struct {
 	workerDone   chan struct{}
 }
 
-func New(cfg config.Config, bus *events.Bus, logger *log.Logger, channelManager *channels.Manager, audioManager *audio.Manager, speechManager *speech.Manager, transcriptManager *transcript.Manager) (*Bridge, error) {
+func New(cfg config.Config, bus *events.Bus, logger *log.Logger, channelManager *channels.Manager, audioManager *audio.Manager, oscManager *osc.Manager, speechManager *speech.Manager, transcriptManager *transcript.Manager) (*Bridge, error) {
 	if bus == nil {
 		return nil, fmt.Errorf("event bus is required")
 	}
@@ -149,6 +199,9 @@ func New(cfg config.Config, bus *events.Bus, logger *log.Logger, channelManager 
 	}
 	if audioManager == nil {
 		return nil, fmt.Errorf("audio manager is required")
+	}
+	if oscManager == nil {
+		return nil, fmt.Errorf("osc manager is required")
 	}
 	if speechManager == nil {
 		return nil, fmt.Errorf("speech manager is required")
@@ -163,8 +216,11 @@ func New(cfg config.Config, bus *events.Bus, logger *log.Logger, channelManager 
 		logger:     logger,
 		channels:   channelManager,
 		audio:      audioManager,
+		osc:        oscManager,
 		speech:     speechManager,
 		transcript: transcriptManager,
+		keywords:   append([]config.KeywordConfig(nil), cfg.Keywords...),
+		oscConfig:  cfg.OSC,
 	}, nil
 }
 
@@ -244,11 +300,81 @@ func (b *Bridge) GetBootstrap() (BootstrapPayload, error) {
 		InputDevices: inputDevices,
 		AudioLevels:  audioLevels,
 		Snapshot:     snapshot,
+		Keywords:     mapKeywordRules(b.keywords),
+		OSC:          mapOSCSettings(b.oscConfig),
 		Speech:       b.speechDiagnostics(),
 		Status:       "live",
 		EngineLabel:  "Offline worker bridge",
 		KeywordCount: len(b.config.Keywords),
 	}, nil
+}
+
+func (b *Bridge) AddChannel(input ChannelAddInput) (Channel, error) {
+	created, err := b.channels.Add(channels.AddRequest{
+		ID:          input.ID,
+		Name:        input.Name,
+		Color:       input.Color,
+		Icon:        input.Icon,
+		InputDevice: input.InputDevice,
+		Language:    input.Language,
+		GainDB:      input.GainDB,
+		Enabled:     input.Enabled,
+	})
+	if err != nil {
+		return Channel{}, err
+	}
+	b.persistChannels()
+	return mapChannel(created), nil
+}
+
+func (b *Bridge) RemoveChannel(channelID string) error {
+	if err := b.channels.Remove(channelID); err != nil {
+		return err
+	}
+	b.persistChannels()
+	return nil
+}
+
+func (b *Bridge) UpdateKeywords(rules []KeywordRuleInput) error {
+	next := make([]config.KeywordConfig, 0, len(rules))
+	for _, rule := range rules {
+		phrase := strings.TrimSpace(rule.Phrase)
+		if phrase == "" {
+			continue
+		}
+		next = append(next, config.KeywordConfig{
+			Phrase:          phrase,
+			HighlightColor:  strings.TrimSpace(rule.HighlightColor),
+			CaseSensitive:   false,
+			WholeWord:       rule.WholeWord,
+			OSCAddress:      strings.TrimSpace(rule.OSCAddress),
+			OSCArguments:    append([]string(nil), rule.OSCArguments...),
+			TriggerEnabled:  rule.TriggerEnabled,
+			HighlightEnable: true,
+		})
+	}
+
+	b.keywords = next
+	b.transcript.UpdateKeywords(next)
+	if err := b.osc.UpdateSettings(b.oscConfig, next); err != nil {
+		return err
+	}
+	b.config.Keywords = append([]config.KeywordConfig(nil), next...)
+	return nil
+}
+
+func (b *Bridge) UpdateOSC(input OSCSettingsInput) error {
+	next := config.OSCConfig{
+		Enabled:     input.Enabled,
+		Destination: strings.TrimSpace(input.Destination),
+		Port:        input.Port,
+	}
+	if err := b.osc.UpdateSettings(next, b.keywords); err != nil {
+		return err
+	}
+	b.oscConfig = next
+	b.config.OSC = next
+	return nil
 }
 
 func (b *Bridge) UpdateChannel(input ChannelUpdateInput) (Channel, error) {
@@ -259,11 +385,13 @@ func (b *Bridge) UpdateChannel(input ChannelUpdateInput) (Channel, error) {
 		Icon:        input.Icon,
 		InputDevice: input.InputDevice,
 		Language:    input.Language,
+		GainDB:      input.GainDB,
 		Enabled:     input.Enabled,
 	})
 	if err != nil {
 		return Channel{}, err
 	}
+	b.persistChannels()
 	return mapChannel(updated), nil
 }
 
@@ -313,7 +441,7 @@ func (b *Bridge) consume(ctx context.Context, subscription *events.Subscription)
 
 func shouldEmit(eventType string) bool {
 	switch eventType {
-	case channels.EventTypeUpdated, transcript.EventTypeUpdated, audio.EventTypeDevicesUpdated, audio.EventTypeChunkCaptured, speech.EventTypeEngineStateChanged:
+	case channels.EventTypeUpdated, channels.EventTypeDeleted, transcript.EventTypeUpdated, audio.EventTypeDevicesUpdated, audio.EventTypeChunkCaptured, speech.EventTypeEngineStateChanged:
 		return true
 	default:
 		return false
@@ -360,6 +488,29 @@ func pointerToDiagnostics(value SpeechDiagnostics) *SpeechDiagnostics {
 	return &value
 }
 
+func mapKeywordRules(keywords []config.KeywordConfig) []KeywordRule {
+	rules := make([]KeywordRule, 0, len(keywords))
+	for _, keyword := range keywords {
+		rules = append(rules, KeywordRule{
+			Phrase:         keyword.Phrase,
+			HighlightColor: keyword.HighlightColor,
+			WholeWord:      keyword.WholeWord,
+			TriggerEnabled: keyword.TriggerEnabled,
+			OSCAddress:     keyword.OSCAddress,
+			OSCArguments:   append([]string(nil), keyword.OSCArguments...),
+		})
+	}
+	return rules
+}
+
+func mapOSCSettings(value config.OSCConfig) OSCSettings {
+	return OSCSettings{
+		Enabled:     value.Enabled,
+		Destination: value.Destination,
+		Port:        value.Port,
+	}
+}
+
 func (b *Bridge) emit(payload SubscriptionPayload) {
 	b.mu.RLock()
 	emitter := b.emitter
@@ -373,6 +524,12 @@ func (b *Bridge) emit(payload SubscriptionPayload) {
 func (b *Bridge) snapshotForFrontend() ([]Channel, []Device, Levels, Snapshot, error) {
 	channelSnapshot := b.channels.Snapshot()
 	deviceInventory := b.audio.Inventory()
+	if len(deviceInventory.Devices) == 0 {
+		refreshCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = b.audio.RefreshInventory(refreshCtx)
+		cancel()
+		deviceInventory = b.audio.Inventory()
+	}
 	audioLevels := b.audio.Levels()
 	transcriptSnapshot := b.transcript.Snapshot()
 
@@ -419,6 +576,7 @@ func mapChannel(channel channels.Channel) Channel {
 		Icon:        channel.Icon,
 		InputDevice: channel.InputDevice,
 		Language:    channel.Language,
+		GainDB:      channel.GainDB,
 		Enabled:     channel.Enabled,
 	}
 }
@@ -465,6 +623,26 @@ func fallback(primary string, secondary string) string {
 		return primary
 	}
 	return secondary
+}
+
+func (b *Bridge) persistChannels() {
+	snapshot := b.channels.Snapshot()
+	persisted := make([]config.ChannelConfig, 0, len(snapshot.Channels))
+	for _, channel := range snapshot.Channels {
+		persisted = append(persisted, config.ChannelConfig{
+			ID:          channel.ID,
+			Name:        channel.Name,
+			Color:       channel.Color,
+			Icon:        channel.Icon,
+			InputDevice: channel.InputDevice,
+			Language:    channel.Language,
+			GainDB:      channel.GainDB,
+			Enabled:     channel.Enabled,
+		})
+	}
+	if err := config.SavePersistedChannels(persisted); err != nil {
+		b.logger.Printf("persist channel settings failed: %v", err)
+	}
 }
 
 func ComponentFactory(bridge *Bridge) app.ComponentFactory {

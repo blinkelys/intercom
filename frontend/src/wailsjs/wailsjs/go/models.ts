@@ -34,6 +34,44 @@ export namespace frontendbridge {
 	        this.updatedAt = source["updatedAt"];
 	    }
 	}
+	export class OSCSettings {
+	    enabled: boolean;
+	    destination: string;
+	    port: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new OSCSettings(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.enabled = source["enabled"];
+	        this.destination = source["destination"];
+	        this.port = source["port"];
+	    }
+	}
+	export class KeywordRule {
+	    phrase: string;
+	    highlightColor: string;
+	    wholeWord: boolean;
+	    triggerEnabled: boolean;
+	    oscAddress: string;
+	    oscArguments: string[];
+	
+	    static createFrom(source: any = {}) {
+	        return new KeywordRule(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.phrase = source["phrase"];
+	        this.highlightColor = source["highlightColor"];
+	        this.wholeWord = source["wholeWord"];
+	        this.triggerEnabled = source["triggerEnabled"];
+	        this.oscAddress = source["oscAddress"];
+	        this.oscArguments = source["oscArguments"];
+	    }
+	}
 	export class Partial {
 	    channelId: string;
 	    channelName: string;
@@ -175,6 +213,7 @@ export namespace frontendbridge {
 	    icon: string;
 	    inputDevice: string;
 	    language: string;
+	    gainDb: number;
 	    enabled: boolean;
 	
 	    static createFrom(source: any = {}) {
@@ -189,6 +228,7 @@ export namespace frontendbridge {
 	        this.icon = source["icon"];
 	        this.inputDevice = source["inputDevice"];
 	        this.language = source["language"];
+	        this.gainDb = source["gainDb"];
 	        this.enabled = source["enabled"];
 	    }
 	}
@@ -197,6 +237,8 @@ export namespace frontendbridge {
 	    inputDevices: Device[];
 	    audioLevels: Record<string, number>;
 	    snapshot: Snapshot;
+	    keywords: KeywordRule[];
+	    osc: OSCSettings;
 	    speech: SpeechDiagnostics;
 	    status: string;
 	    engineLabel: string;
@@ -212,6 +254,8 @@ export namespace frontendbridge {
 	        this.inputDevices = this.convertValues(source["inputDevices"], Device);
 	        this.audioLevels = source["audioLevels"];
 	        this.snapshot = this.convertValues(source["snapshot"], Snapshot);
+	        this.keywords = this.convertValues(source["keywords"], KeywordRule);
+	        this.osc = this.convertValues(source["osc"], OSCSettings);
 	        this.speech = this.convertValues(source["speech"], SpeechDiagnostics);
 	        this.status = source["status"];
 	        this.engineLabel = source["engineLabel"];
@@ -237,6 +281,32 @@ export namespace frontendbridge {
 		}
 	}
 	
+	export class ChannelAddInput {
+	    id: string;
+	    name: string;
+	    color: string;
+	    icon: string;
+	    inputDevice: string;
+	    language: string;
+	    gainDb: number;
+	    enabled: boolean;
+	
+	    static createFrom(source: any = {}) {
+	        return new ChannelAddInput(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.id = source["id"];
+	        this.name = source["name"];
+	        this.color = source["color"];
+	        this.icon = source["icon"];
+	        this.inputDevice = source["inputDevice"];
+	        this.language = source["language"];
+	        this.gainDb = source["gainDb"];
+	        this.enabled = source["enabled"];
+	    }
+	}
 	export class ChannelUpdateInput {
 	    id: string;
 	    name: string;
@@ -244,6 +314,7 @@ export namespace frontendbridge {
 	    icon: string;
 	    inputDevice: string;
 	    language: string;
+	    gainDb: number;
 	    enabled: boolean;
 	
 	    static createFrom(source: any = {}) {
@@ -258,12 +329,53 @@ export namespace frontendbridge {
 	        this.icon = source["icon"];
 	        this.inputDevice = source["inputDevice"];
 	        this.language = source["language"];
+	        this.gainDb = source["gainDb"];
 	        this.enabled = source["enabled"];
 	    }
 	}
 	
 	
 	
+	
+	export class KeywordRuleInput {
+	    phrase: string;
+	    highlightColor: string;
+	    wholeWord: boolean;
+	    triggerEnabled: boolean;
+	    oscAddress: string;
+	    oscArguments: string[];
+	
+	    static createFrom(source: any = {}) {
+	        return new KeywordRuleInput(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.phrase = source["phrase"];
+	        this.highlightColor = source["highlightColor"];
+	        this.wholeWord = source["wholeWord"];
+	        this.triggerEnabled = source["triggerEnabled"];
+	        this.oscAddress = source["oscAddress"];
+	        this.oscArguments = source["oscArguments"];
+	    }
+	}
+	
+	export class OSCSettingsInput {
+	    enabled: boolean;
+	    destination: string;
+	    port: number;
+	
+	    static createFrom(source: any = {}) {
+	        return new OSCSettingsInput(source);
+	    }
+	
+	    constructor(source: any = {}) {
+	        if ('string' === typeof source) source = JSON.parse(source);
+	        this.enabled = source["enabled"];
+	        this.destination = source["destination"];
+	        this.port = source["port"];
+	    }
+	}
 	
 	
 

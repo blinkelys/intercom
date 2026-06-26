@@ -137,6 +137,39 @@ func (m *Manager) Stop(ctx context.Context) error {
 	}
 }
 
+// UpdateSettings replaces OSC destination/enable flags and keyword trigger rules at runtime.
+func (m *Manager) UpdateSettings(oscConfig config.OSCConfig, keywordRules []config.KeywordConfig) error {
+	rules := make(map[string]config.KeywordConfig, len(keywordRules))
+	for _, rule := range keywordRules {
+		rules[rule.Phrase] = rule
+	}
+
+	m.mu.Lock()
+	m.config.OSC = oscConfig
+	m.rules = rules
+	if !oscConfig.Enabled {
+		m.sender = nil
+		m.mu.Unlock()
+		return nil
+	}
+
+	if oscConfig.Destination == "" || oscConfig.Port <= 0 || oscConfig.Port > 65535 {
+		m.sender = nil
+		m.mu.Unlock()
+		return fmt.Errorf("invalid osc destination configuration")
+	}
+
+	sender, err := NewUDPClient(oscConfig.Destination, oscConfig.Port)
+	if err != nil {
+		m.sender = nil
+		m.mu.Unlock()
+		return err
+	}
+	m.sender = sender
+	m.mu.Unlock()
+	return nil
+}
+
 func (m *Manager) consume(ctx context.Context, subscription *events.Subscription, queue chan<- Message) {
 	for {
 		select {
@@ -150,15 +183,25 @@ func (m *Manager) consume(ctx context.Context, subscription *events.Subscription
 				continue
 			}
 			update, ok := event.Payload.(transcript.Update)
-			if !ok || update.Kind != "final" || update.EntryID == "" || !m.config.OSC.Enabled {
+			m.mu.Lock()
+			enabled := m.config.OSC.Enabled
+			m.mu.Unlock()
+			if !ok || update.Kind != "final" || update.EntryID == "" || !enabled {
 				continue
 			}
 			entry, ok := m.transcript.Entry(update.EntryID)
 			if !ok {
 				continue
 			}
+			m.mu.Lock()
+			rules := make(map[string]config.KeywordConfig, len(m.rules))
+			for key, rule := range m.rules {
+				rules[key] = rule
+			}
+			m.mu.Unlock()
+
 			for _, keyword := range entry.Keywords {
-				rule, exists := m.rules[keyword]
+				rule, exists := rules[keyword]
 				if !exists || !rule.TriggerEnabled || rule.OSCAddress == "" {
 					continue
 				}
@@ -183,10 +226,13 @@ func (m *Manager) dispatch(ctx context.Context, queue <-chan Message, done chan<
 			if !ok {
 				return
 			}
-			if m.sender == nil {
+			m.mu.Lock()
+			sender := m.sender
+			m.mu.Unlock()
+			if sender == nil {
 				continue
 			}
-			if err := m.sender.Send(message); err != nil {
+			if err := sender.Send(message); err != nil {
 				m.logger.Printf("osc send failed address=%s: %v", message.Address, err)
 			}
 		}

@@ -13,7 +13,7 @@ import (
 func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
-	logger := log.New(os.Stdout, "procom ", log.LstdFlags|log.Lmicroseconds)
+	logger := log.New(os.Stdout, "intercom ", log.LstdFlags|log.Lmicroseconds)
 
 	runtimeBundle, err := bootstrap.NewRuntime(logger)
 	if err != nil {

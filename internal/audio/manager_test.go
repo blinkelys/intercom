@@ -2,6 +2,7 @@ package audio
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log"
 	"reflect"
@@ -13,7 +14,7 @@ import (
 	"procom/internal/events"
 )
 
-func TestManagerAutoAssignsDeviceAndReportsMissingDevices(t *testing.T) {
+func TestManagerKeepsUnassignedAndRecoversStaleConfiguredDevices(t *testing.T) {
 	t.Parallel()
 
 	bus, err := events.NewBus(16)
@@ -32,8 +33,8 @@ func TestManagerAutoAssignsDeviceAndReportsMissingDevices(t *testing.T) {
 			{ID: "md", Name: "Musical Director", Enabled: true, InputDevice: "missing-device"},
 		},
 	}, bus, log.New(io.Discard, "", 0), fakeDriver{
-		devices: []Device{{ID: "device-1", Name: "Mic 1"}},
-		streams: map[string]*fakeStream{"producer": newFakeStream()},
+		devices: []Device{{ID: "device-1", Name: "Mic 1"}, {ID: "device-2", Name: "Mic 2"}},
+		streams: map[string]*fakeStream{"producer": newFakeStream(), "md": newFakeStream()},
 	})
 	if err != nil {
 		t.Fatalf("new manager: %v", err)
@@ -54,11 +55,11 @@ func TestManagerAutoAssignsDeviceAndReportsMissingDevices(t *testing.T) {
 	}()
 
 	states := collectPipelineStates(t, subscription.Events(), 3)
-	if !containsState(states, "producer", PipelineStateRunning) {
-		t.Fatalf("expected running state in %v", states)
+	if !containsState(states, "producer", PipelineStateUnassigned) {
+		t.Fatalf("expected unassigned state in %v", states)
 	}
-	if !containsState(states, "md", PipelineStateMissingDevice) {
-		t.Fatalf("expected missing-device state in %v", states)
+	if !containsState(states, "md", PipelineStateRunning) {
+		t.Fatalf("expected running state in %v", states)
 	}
 }
 
@@ -187,7 +188,7 @@ func TestManagerReconfiguresPipelineOnChannelUpdate(t *testing.T) {
 	}
 }
 
-func TestManagerUnassignUpdateStopsChannelPipeline(t *testing.T) {
+func TestManagerEmptyInputUpdateKeepsExistingPipeline(t *testing.T) {
 	t.Parallel()
 
 	bus, err := events.NewBus(32)
@@ -244,11 +245,281 @@ func TestManagerUnassignUpdateStopsChannelPipeline(t *testing.T) {
 		OccurredAt: time.Now().UTC(),
 	}})
 
-	waitForPipelineState(t, subscription.Events(), "producer", PipelineStateUnassigned)
-
-	if levels := manager.Levels(); len(levels) != 0 {
-		t.Fatalf("levels = %#v, want empty after unassign", levels)
+	time.Sleep(100 * time.Millisecond)
+	if levels := manager.Levels(); len(levels) == 0 {
+		t.Fatalf("levels = %#v, want channel to stay active", levels)
 	}
+}
+
+func TestManagerRefreshInventoryPreservesExistingDevicesOnFailure(t *testing.T) {
+	t.Parallel()
+
+	bus, err := events.NewBus(16)
+	if err != nil {
+		t.Fatalf("new bus: %v", err)
+	}
+
+	driver := &sequenceDriver{
+		calls: []deviceCall{
+			{devices: []Device{{ID: "device-1", Name: "Mic 1"}}},
+			{err: errors.New("helper timeout")},
+		},
+		streams: map[string]*fakeStream{
+			"producer": newFakeStream(SampleChunk{Frames: []float32{0.2}}),
+		},
+	}
+
+	manager, err := NewManager(config.Config{
+		Channels: []config.ChannelConfig{{
+			ID:          "producer",
+			Name:        "Producer",
+			Enabled:     true,
+			InputDevice: "device-1",
+		}},
+	}, bus, log.New(io.Discard, "", 0), driver)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := manager.Start(ctx); err != nil {
+		t.Fatalf("start manager: %v", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
+		defer stopCancel()
+		if err := manager.Stop(stopCtx); err != nil {
+			t.Fatalf("stop manager: %v", err)
+		}
+	}()
+
+	if err := manager.RefreshInventory(ctx); err == nil {
+		t.Fatal("expected refresh inventory error")
+	}
+
+	inventory := manager.Inventory()
+	if len(inventory.Devices) != 1 || inventory.Devices[0].ID != "device-1" {
+		t.Fatalf("inventory devices = %#v, want preserved existing devices", inventory.Devices)
+	}
+}
+
+func TestManagerRecoversPipelinesAfterStartupInventoryFailure(t *testing.T) {
+	t.Parallel()
+
+	bus, err := events.NewBus(32)
+	if err != nil {
+		t.Fatalf("new bus: %v", err)
+	}
+	subscription, err := bus.Subscribe()
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer subscription.Close()
+
+	driver := &sequenceDriver{
+		calls: []deviceCall{
+			{err: errors.New("enumeration failed")},
+			{devices: []Device{{ID: "device-1", Name: "Mic 1"}}},
+		},
+		streams: map[string]*fakeStream{
+			"producer": newFakeStream(SampleChunk{Frames: []float32{0.3}}),
+		},
+	}
+
+	manager, err := NewManager(config.Config{
+		Channels: []config.ChannelConfig{{
+			ID:          "producer",
+			Name:        "Producer",
+			Enabled:     true,
+			InputDevice: "device-1",
+		}},
+	}, bus, log.New(io.Discard, "", 0), driver)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := manager.Start(ctx); err != nil {
+		t.Fatalf("start manager: %v", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
+		defer stopCancel()
+		if err := manager.Stop(stopCtx); err != nil {
+			t.Fatalf("stop manager: %v", err)
+		}
+	}()
+
+	waitForPipelineState(t, subscription.Events(), "producer", PipelineStateMissingDevice)
+
+	if err := manager.RefreshInventory(ctx); err != nil {
+		t.Fatalf("refresh inventory: %v", err)
+	}
+
+	waitForPipelineState(t, subscription.Events(), "producer", PipelineStateRunning)
+	_ = waitForChunk(t, subscription.Events(), "producer")
+}
+
+func TestManagerRecoversStaleConfiguredChannelAfterInventoryBecomesAvailable(t *testing.T) {
+	t.Parallel()
+
+	bus, err := events.NewBus(32)
+	if err != nil {
+		t.Fatalf("new bus: %v", err)
+	}
+	subscription, err := bus.Subscribe()
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer subscription.Close()
+
+	driver := &sequenceDriver{
+		calls: []deviceCall{
+			{err: errors.New("enumeration failed")},
+			{devices: []Device{{ID: "device-1", Name: "Mic 1"}}},
+		},
+		streams: map[string]*fakeStream{
+			"producer": newFakeStream(SampleChunk{Frames: []float32{0.9}}),
+		},
+	}
+
+	manager, err := NewManager(config.Config{
+		Channels: []config.ChannelConfig{{
+			ID:          "producer",
+			Name:        "Producer",
+			Enabled:     true,
+			InputDevice: "stale-device-id",
+		}},
+	}, bus, log.New(io.Discard, "", 0), driver)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := manager.Start(ctx); err != nil {
+		t.Fatalf("start manager: %v", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
+		defer stopCancel()
+		if err := manager.Stop(stopCtx); err != nil {
+			t.Fatalf("stop manager: %v", err)
+		}
+	}()
+
+	waitForPipelineState(t, subscription.Events(), "producer", PipelineStateMissingDevice)
+
+	if err := manager.RefreshInventory(ctx); err != nil {
+		t.Fatalf("refresh inventory: %v", err)
+	}
+
+	waitForPipelineState(t, subscription.Events(), "producer", PipelineStateRunning)
+	_ = waitForChunk(t, subscription.Events(), "producer")
+}
+
+func TestManagerAutoAssignsWhenConfiguredDeviceIsUnavailable(t *testing.T) {
+	t.Parallel()
+
+	bus, err := events.NewBus(32)
+	if err != nil {
+		t.Fatalf("new bus: %v", err)
+	}
+	subscription, err := bus.Subscribe()
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer subscription.Close()
+
+	manager, err := NewManager(config.Config{
+		Channels: []config.ChannelConfig{{
+			ID:          "producer",
+			Name:        "Producer",
+			Enabled:     true,
+			InputDevice: "stale-device-id",
+		}},
+	}, bus, log.New(io.Discard, "", 0), fakeDriver{
+		devices: []Device{{ID: "device-1", Name: "Mic 1"}},
+		streams: map[string]*fakeStream{"producer": newFakeStream(SampleChunk{Frames: []float32{0.6}})},
+	})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := manager.Start(ctx); err != nil {
+		t.Fatalf("start manager: %v", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
+		defer stopCancel()
+		if err := manager.Stop(stopCtx); err != nil {
+			t.Fatalf("stop manager: %v", err)
+		}
+	}()
+
+	waitForPipelineState(t, subscription.Events(), "producer", PipelineStateRunning)
+	_ = waitForChunk(t, subscription.Events(), "producer")
+}
+
+func TestManagerPeriodicRecoveryRestartsFailedPipeline(t *testing.T) {
+	t.Parallel()
+
+	bus, err := events.NewBus(64)
+	if err != nil {
+		t.Fatalf("new bus: %v", err)
+	}
+	subscription, err := bus.Subscribe()
+	if err != nil {
+		t.Fatalf("subscribe: %v", err)
+	}
+	defer subscription.Close()
+
+	driver := &transientOpenDriver{
+		devices: []Device{{ID: "device-1", Name: "Mic 1"}},
+		failOpen: map[string]int{
+			"producer": 1,
+		},
+		streams: map[string]*fakeStream{
+			"producer": newFakeStream(SampleChunk{Frames: []float32{0.7}}),
+		},
+	}
+
+	manager, err := NewManager(config.Config{
+		Channels: []config.ChannelConfig{{
+			ID:          "producer",
+			Name:        "Producer",
+			Enabled:     true,
+			InputDevice: "device-1",
+		}},
+	}, bus, log.New(io.Discard, "", 0), driver, WithRecoveryTick(50*time.Millisecond))
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	if err := manager.Start(ctx); err != nil {
+		t.Fatalf("start manager: %v", err)
+	}
+	defer func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), time.Second)
+		defer stopCancel()
+		if err := manager.Stop(stopCtx); err != nil {
+			t.Fatalf("stop manager: %v", err)
+		}
+	}()
+
+	waitForPipelineState(t, subscription.Events(), "producer", PipelineStateFailed)
+	waitForPipelineState(t, subscription.Events(), "producer", PipelineStateRunning)
 }
 
 type fakeDriver struct {
@@ -261,6 +532,58 @@ func (d fakeDriver) Devices(context.Context) ([]Device, error) {
 }
 
 func (d fakeDriver) OpenStream(_ context.Context, cfg StreamConfig) (Stream, error) {
+	if stream, ok := d.streams[cfg.ChannelID]; ok {
+		return stream, nil
+	}
+	return nil, errStreamUnsupported
+}
+
+type deviceCall struct {
+	devices []Device
+	err     error
+}
+
+type sequenceDriver struct {
+	calls   []deviceCall
+	index   int
+	streams map[string]*fakeStream
+}
+
+func (d *sequenceDriver) Devices(context.Context) ([]Device, error) {
+	if len(d.calls) == 0 {
+		return nil, nil
+	}
+	if d.index >= len(d.calls) {
+		last := d.calls[len(d.calls)-1]
+		return append([]Device(nil), last.devices...), last.err
+	}
+	call := d.calls[d.index]
+	d.index += 1
+	return append([]Device(nil), call.devices...), call.err
+}
+
+func (d *sequenceDriver) OpenStream(_ context.Context, cfg StreamConfig) (Stream, error) {
+	if stream, ok := d.streams[cfg.ChannelID]; ok {
+		return stream, nil
+	}
+	return nil, errStreamUnsupported
+}
+
+type transientOpenDriver struct {
+	devices  []Device
+	failOpen map[string]int
+	streams  map[string]*fakeStream
+}
+
+func (d *transientOpenDriver) Devices(context.Context) ([]Device, error) {
+	return append([]Device(nil), d.devices...), nil
+}
+
+func (d *transientOpenDriver) OpenStream(_ context.Context, cfg StreamConfig) (Stream, error) {
+	if remaining := d.failOpen[cfg.ChannelID]; remaining > 0 {
+		d.failOpen[cfg.ChannelID] = remaining - 1
+		return nil, errors.New("transient open failure")
+	}
 	if stream, ok := d.streams[cfg.ChannelID]; ok {
 		return stream, nil
 	}
