@@ -37,6 +37,10 @@ type Manager struct {
 	sentenceMinPunctuated     int
 	sentenceMaxBufferDuration time.Duration
 	minChunkRMS               float64
+	minChunkPeak              float64
+	vadFloorMin               float64
+	vadFloorMultiplier        float64
+	vadNoiseUpdateAlpha       float64
 	minFinalChars             int
 
 	mu           sync.Mutex
@@ -70,11 +74,15 @@ type bufferedSentence struct {
 }
 
 const (
-	sentenceFlushTick      = 300 * time.Millisecond
-	defaultSentenceMaxWait = 1400 * time.Millisecond
-	defaultMinWords        = 8
-	defaultMinPunctWords   = 4
-	defaultMinChunkRMS     = 0.00002
+	sentenceFlushTick      = 200 * time.Millisecond
+	defaultSentenceMaxWait = 850 * time.Millisecond
+	defaultMinWords        = 4
+	defaultMinPunctWords   = 2
+	defaultMinChunkRMS     = 0.00012
+	defaultMinChunkPeak    = 0.003
+	defaultVADFloorMin     = 0.00006
+	defaultVADFloorMul     = 2.8
+	defaultVADNoiseAlpha   = 0.08
 	defaultMinFinalChars   = 2
 	maxPromptChars         = 520
 	maxContextChars        = 160
@@ -110,6 +118,10 @@ func NewManager(cfg config.Config, bus *events.Bus, logger *log.Logger, build En
 		sentenceMinPunctuated:     getenvIntDefault("PROCOM_SENTENCE_MIN_PUNCT_WORDS", defaultMinPunctWords),
 		sentenceMaxBufferDuration: time.Duration(getenvIntDefault("PROCOM_SENTENCE_MAX_WAIT_MS", int(defaultSentenceMaxWait/time.Millisecond))) * time.Millisecond,
 		minChunkRMS:               getenvFloatDefault("PROCOM_AUDIO_MIN_RMS", defaultMinChunkRMS),
+		minChunkPeak:              getenvFloatDefault("PROCOM_AUDIO_MIN_PEAK", defaultMinChunkPeak),
+		vadFloorMin:               getenvFloatDefault("PROCOM_AUDIO_VAD_FLOOR_MIN", defaultVADFloorMin),
+		vadFloorMultiplier:        getenvFloatDefault("PROCOM_AUDIO_VAD_FLOOR_MUL", defaultVADFloorMul),
+		vadNoiseUpdateAlpha:       getenvFloatDefault("PROCOM_AUDIO_VAD_NOISE_ALPHA", defaultVADNoiseAlpha),
 		minFinalChars:             getenvIntDefault("PROCOM_MIN_FINAL_CHARS", defaultMinFinalChars),
 		diagnostics: Diagnostics{
 			Model:            getenvDefault("PROCOM_MLX_MODEL", "mlx-community/whisper-tiny"),
@@ -245,6 +257,7 @@ func (m *Manager) consumeAudioEvents(ctx context.Context, subscription *events.S
 	pendingByChannel := make(map[string][]float32)
 	pendingRate := make(map[string]int)
 	pendingCapturedAt := make(map[string]time.Time)
+	noiseFloorByChannel := make(map[string]float64)
 	flushTicker := time.NewTicker(250 * time.Millisecond)
 	defer flushTicker.Stop()
 
@@ -266,8 +279,9 @@ func (m *Manager) consumeAudioEvents(ctx context.Context, subscription *events.S
 
 		language := m.channelLanguage[channelID]
 		rms := calculateRMS(frames)
-		if rms < m.minChunkRMS {
-			m.logger.Printf("speech manager skip low-rms chunk channel=%s frames=%d rms=%.5f threshold=%.5f", channelID, len(frames), rms, m.minChunkRMS)
+		peak := calculatePeak(frames)
+		if !m.shouldSubmitChunk(channelID, rms, peak, noiseFloorByChannel) {
+			m.logger.Printf("speech manager vad-drop channel=%s frames=%d rms=%.6f peak=%.6f floor=%.6f", channelID, len(frames), rms, peak, noiseFloorByChannel[channelID])
 			delete(pendingByChannel, channelID)
 			delete(pendingRate, channelID)
 			delete(pendingCapturedAt, channelID)
@@ -475,6 +489,54 @@ func calculateRMS(frames []float32) float64 {
 	return sqrt(sum / float64(len(frames)))
 }
 
+func calculatePeak(frames []float32) float64 {
+	if len(frames) == 0 {
+		return 0
+	}
+	peak := 0.0
+	for _, sample := range frames {
+		value := float64(sample)
+		if value < 0 {
+			value = -value
+		}
+		if value > peak {
+			peak = value
+		}
+	}
+	return peak
+}
+
+func (m *Manager) shouldSubmitChunk(channelID string, rms float64, peak float64, floorByChannel map[string]float64) bool {
+	floor := floorByChannel[channelID]
+	if floor == 0 {
+		floor = m.vadFloorMin
+	}
+
+	if rms < floor {
+		floor = ((1 - m.vadNoiseUpdateAlpha) * floor) + (m.vadNoiseUpdateAlpha * rms)
+		if floor < m.vadFloorMin {
+			floor = m.vadFloorMin
+		}
+		floorByChannel[channelID] = floor
+	} else {
+		floorByChannel[channelID] = floor
+	}
+
+	dynamicThreshold := floor * m.vadFloorMultiplier
+	if dynamicThreshold < m.minChunkRMS {
+		dynamicThreshold = m.minChunkRMS
+	}
+
+	if rms < dynamicThreshold && peak < m.minChunkPeak {
+		return false
+	}
+
+	if rms > floor {
+		floorByChannel[channelID] = floor + ((rms-floor)*0.02)
+	}
+	return true
+}
+
 func sqrt(value float64) float64 {
 	if value <= 0 {
 		return 0
@@ -524,6 +586,7 @@ func getenvFloatDefault(key string, fallback float64) float64 {
 func (m *Manager) consumeResults(ctx context.Context, engine Engine) {
 	defer m.wg.Done()
 	pending := make(map[string]bufferedSentence)
+	partialStable := make(map[string]string)
 	lastEmitted := make(map[string]string)
 	flushTicker := time.NewTicker(sentenceFlushTick)
 	defer flushTicker.Stop()
@@ -559,6 +622,7 @@ func (m *Manager) consumeResults(ctx context.Context, engine Engine) {
 
 		result.ReceivedAt = time.Now().UTC()
 		delete(pending, channelID)
+		delete(partialStable, channelID)
 		lastEmitted[channelID] = normalized
 		m.rememberContext(channelID, result.Text)
 		m.bus.Publish(events.Event{Type: EventTypeResultFinal, Payload: result})
@@ -602,6 +666,10 @@ func (m *Manager) consumeResults(ctx context.Context, engine Engine) {
 			}
 
 			if !result.Final {
+				stable := stabilizePartialText(partialStable[result.ChannelID], result.Text)
+				partialStable[result.ChannelID] = stable
+				result.Text = stable
+				m.rememberContext(result.ChannelID, stable)
 				m.bus.Publish(events.Event{Type: EventTypeResultPartial, Payload: result})
 				continue
 			}
@@ -634,6 +702,7 @@ func (m *Manager) consumeResults(ctx context.Context, engine Engine) {
 			preview := result
 			preview.Final = false
 			preview.Text = current.text
+			partialStable[result.ChannelID] = current.text
 			m.bus.Publish(events.Event{Type: EventTypeResultPartial, Payload: preview})
 		}
 	}
@@ -671,6 +740,40 @@ func mergeSentenceText(existing string, next string) string {
 		return right
 	}
 	return left + " " + right
+}
+
+func stabilizePartialText(previous string, incoming string) string {
+	left := strings.Fields(previous)
+	right := strings.Fields(incoming)
+	if len(right) == 0 {
+		return strings.TrimSpace(previous)
+	}
+	if len(left) == 0 {
+		return strings.Join(right, " ")
+	}
+
+	limit := len(left)
+	if len(right) < limit {
+		limit = len(right)
+	}
+	prefix := 0
+	for prefix < limit {
+		if !strings.EqualFold(left[prefix], right[prefix]) {
+			break
+		}
+		prefix++
+	}
+
+	if prefix == 0 {
+		return strings.Join(right, " ")
+	}
+
+	locked := left[:prefix]
+	tail := right[prefix:]
+	if len(tail) == 0 {
+		return strings.Join(locked, " ")
+	}
+	return strings.Join(append(locked, tail...), " ")
 }
 
 func (m *Manager) isClearSentence(text string) bool {

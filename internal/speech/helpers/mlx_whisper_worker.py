@@ -32,16 +32,20 @@ CONDITION_ON_PREVIOUS_TEXT = os.environ.get("PROCOM_MLX_CONDITION_ON_PREVIOUS_TE
 LANGUAGE_ALIASES = {
     "en": "en",
     "english": "en",
-    "no": "nb",
-    "nb": "nb",
-    "nn": "nb",
+    "no": "no",
+    "nb": "no",
+    "nn": "nn",
     "norwegian": "no",
     "norsk": "no",
 }
 
 PARTIAL_INTERVAL_SECONDS = int(os.environ.get("PROCOM_MLX_PARTIAL_INTERVAL_SECONDS", "1"))
-FINAL_WINDOW_SECONDS = int(os.environ.get("PROCOM_MLX_FINAL_WINDOW_SECONDS", "5"))
-MAX_BUFFER_SECONDS = int(os.environ.get("PROCOM_MLX_MAX_BUFFER_SECONDS", "12"))
+PARTIAL_INTERVAL_MS = int(os.environ.get("PROCOM_MLX_PARTIAL_INTERVAL_MS", "400"))
+FINAL_WINDOW_SECONDS = int(os.environ.get("PROCOM_MLX_FINAL_WINDOW_SECONDS", "2"))
+MAX_BUFFER_SECONDS = int(os.environ.get("PROCOM_MLX_MAX_BUFFER_SECONDS", "8"))
+VAD_RMS_GATE = float(os.environ.get("PROCOM_MLX_VAD_RMS_GATE", "0.00012"))
+VAD_PEAK_GATE = float(os.environ.get("PROCOM_MLX_VAD_PEAK_GATE", "0.003"))
+TEXT_REWRITE_PAIRS = os.environ.get("PROCOM_TEXT_REWRITE_PAIRS", "")
 
 
 class ChannelState:
@@ -105,6 +109,38 @@ def is_repetitive_speaker_loop(text):
         if pattern * (len(words) // size) == words:
             return True
     return False
+
+
+def parse_rewrite_pairs(raw):
+    pairs = []
+    for part in str(raw or "").split(";;"):
+        item = part.strip()
+        if not item or "=>" not in item:
+            continue
+        left, right = item.split("=>", 1)
+        left = left.strip()
+        right = right.strip()
+        if left:
+            pairs.append((left, right))
+    return pairs
+
+
+REWRITE_RULES = parse_rewrite_pairs(TEXT_REWRITE_PAIRS)
+
+
+def postprocess_text(text, language):
+    value = " ".join(str(text or "").strip().split())
+    if not value:
+        return ""
+
+    for left, right in REWRITE_RULES:
+        value = re.sub(re.escape(left), right, value, flags=re.IGNORECASE)
+
+    if language in ("nb", "no", "nn"):
+        value = re.sub(r"\b(Speaker|speaker)\s*\d+\b", "", value).strip()
+        value = re.sub(r"\s{2,}", " ", value)
+
+    return value
 
 
 def run_transcribe_with_fallback(normalized_audio, kwargs):
@@ -205,6 +241,7 @@ def transcribe_channel(channel_id, final):
         elapsed_ms = int((time.time() - started) * 1000)
         text = (result.get("text") or "").strip()
         text = strip_repeated_speaker_labels(text)
+        text = postprocess_text(text, language)
         segments = result.get("segments") or []
         avg_logprob = None
         no_speech_prob = None
@@ -240,10 +277,10 @@ def transcribe_channel(channel_id, final):
             if too_quiet:
                 suspicious_signals += 1
 
-            # Fail open for live production use: drop only when several quality signals agree.
+            # Fail-open mode: keep transcribing even on weak confidence signals.
             if suspicious_signals >= 3 and len(text) < 24:
                 log(
-                    "infer filtered channel={} final={} text_len={} signals={} avg_logprob={} no_speech_prob={} compression_ratio={} rms={}".format(
+                    "infer low-confidence-accepted channel={} final={} text_len={} signals={} avg_logprob={} no_speech_prob={} compression_ratio={} rms={}".format(
                         channel_id,
                         final,
                         len(text),
@@ -254,7 +291,6 @@ def transcribe_channel(channel_id, final):
                         current_rms,
                     )
                 )
-                return
 
         log(f"infer done channel={channel_id} final={final} chars={len(text)} elapsed_ms={elapsed_ms}")
         if text:
@@ -311,7 +347,13 @@ for line in sys.stdin:
         state.chunks.append(frames)
         compact_buffer(state)
 
-        partial_interval = state.sample_rate * PARTIAL_INTERVAL_SECONDS
+        rms = float(np.sqrt(np.mean(np.square(frames)))) if frames.size > 0 else 0.0
+        peak = float(np.max(np.abs(frames))) if frames.size > 0 else 0.0
+        if rms < VAD_RMS_GATE and peak < VAD_PEAK_GATE:
+            log(f"chunk skipped by VAD channel={channel_id} rms={rms:.6f} peak={peak:.6f}")
+            continue
+
+        partial_interval = max(1, int((state.sample_rate * PARTIAL_INTERVAL_MS) / 1000))
         if state.total_samples-state.last_partial_samples >= partial_interval:
             transcribe_channel(channel_id, final=False)
             state.last_partial_samples = state.total_samples
